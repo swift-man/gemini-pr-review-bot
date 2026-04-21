@@ -15,6 +15,12 @@ logger = logging.getLogger(__name__)
 
 _SUPPORTED_ACTIONS = {"opened", "synchronize", "reopened", "ready_for_review"}
 
+# 종료 시 워커가 현재 작업을 끝낼 때까지 기다리는 기본 시간.
+# 대형 리뷰(gemini CLI 5~10분)는 이 안에 안 끝나지만, idle 큐 drain 과 짧은 리뷰
+# (캐시 히트 / 초기 에러 등) 는 충분히 소화한다. uvicorn 의 shutdown 예산 안에
+# 들어오도록 너무 길게 잡지 않는다.
+_DEFAULT_STOP_TIMEOUT_SEC = 10.0
+
 
 @dataclass(frozen=True)
 class WebhookJob:
@@ -22,6 +28,11 @@ class WebhookJob:
     repo: RepoRef
     number: int
     installation_id: int
+
+    def __str__(self) -> str:
+        # stop() 의 드롭 로그와 운영 관측성에 쓰이는 공용 포맷. delivery_id 와 PR 식별자가
+        # 함께 찍혀야 GitHub Recent Deliveries 와 교차 대조 + 재시도 대상 식별이 가능.
+        return f"{self.delivery_id}({self.repo.full_name}#{self.number})"
 
 
 class WebhookHandler:
@@ -39,6 +50,10 @@ class WebhookHandler:
         self._queue: queue.Queue[WebhookJob] = queue.Queue()
         self._worker: threading.Thread | None = None
         self._stop = threading.Event()
+        # 현재 처리 중인 작업 — 종료 시 "어떤 리뷰가 드롭됐는지" 가시화용.
+        # 데이터 레이스를 피하려면 이 필드는 _in_flight_lock 안에서만 읽고 쓴다.
+        self._in_flight_lock = threading.Lock()
+        self._in_flight: WebhookJob | None = None
 
     # --- 라이프사이클 --------------------------------------------------------
 
@@ -51,8 +66,74 @@ class WebhookHandler:
         )
         self._worker.start()
 
-    def stop(self) -> None:
+    def stop(self, timeout: float = _DEFAULT_STOP_TIMEOUT_SEC) -> None:
+        """워커에게 중단 신호를 보낸 뒤 `timeout` 초까지 완료를 기다린다.
+
+        단순히 플래그만 세우던 기존 동작은 `daemon=True` 스레드를 즉시 종료시켜
+        리뷰 중이던 작업이 GitHub 에 202 로 접수된 채 영구 유실됐다.
+        (우선순위 #3 — 데이터 손실 / 상태 불일치)
+
+        본 구현은 데몬 스레드를 유지해 uvicorn 이 끝내 종료될 수 있게 하면서,
+        idle 큐 drain 과 짧은 리뷰가 자연스럽게 끝날 시간을 준다. gemini CLI 호출
+        중인 대형 리뷰는 timeout 을 초과해도 드롭되지만, 그 때는 **어떤 작업이
+        유실됐는지** 를 ERROR 로그에 명시해 운영자가 재시도(빈 커밋 push 등) 할
+        근거를 남긴다.
+        """
+        worker = self._worker
+        if worker is None:
+            return
+
+        with self._in_flight_lock:
+            in_flight_snapshot = self._in_flight
+        queued_before = self._queue.qsize()
+
+        if in_flight_snapshot is not None or queued_before > 0:
+            logger.warning(
+                "shutting down with pending work — in_flight=%s, queued=%d; "
+                "waiting up to %.1fs for graceful completion",
+                in_flight_snapshot or "none",
+                queued_before,
+                timeout,
+            )
+
         self._stop.set()
+        worker.join(timeout=timeout)
+
+        if worker.is_alive():
+            # 워커가 timeout 안에 안 끝남 — 데몬이라 프로세스 종료 시 강제로 죽는다.
+            # worker 는 이 시점 이전에 이미 _stop 신호로 get() 루프를 벗어났어야 하지만,
+            # _process 내부 블로킹(gemini CLI) 으로 묶여 있는 경우도 있다. 어쨌든 큐에는
+            # 더 이상 손대지 않으므로 내부 deque 스냅샷이 안정.
+            with self._in_flight_lock:
+                still_in_flight = self._in_flight
+            remaining_jobs = self._snapshot_queue()
+            logger.error(
+                "worker did not finish within %.1fs; review in-flight=%s, "
+                "remaining_queue=[%s] may be lost. "
+                "operator: re-trigger the affected PR(s) with an empty commit.",
+                timeout,
+                still_in_flight or "none",
+                ", ".join(str(job) for job in remaining_jobs) or "empty",
+            )
+            # _worker 는 일부러 정리하지 않는다. 스레드 객체가 아직 살아 있는 상태에서
+            # 레퍼런스를 지우면 후속 start() 가 좀비 옆에 새 워커를 띄워 중복 실행된다.
+            return
+
+        # 정상 종료 — 인스턴스가 start() 로 재사용될 수 있도록 스레드 레퍼런스 초기화.
+        # (운영상 같은 인스턴스 재사용은 드물지만, lifespan 이 restart 되거나 테스트가
+        #  한 인스턴스를 stop/start 순서로 검증하는 경우 필요.)
+        self._worker = None
+
+    def _snapshot_queue(self) -> list[WebhookJob]:
+        """락을 잡고 내부 deque 를 얕은 복사로 찍는다 — 드롭 대상 식별용.
+
+        `Queue.mutex` 는 문서화된 락이며 여기서 잠깐 잡아 스냅샷만 떠 나와도 워커가
+        어차피 `_stop` 이후 get() 하지 않으므로 경합 위험이 없다. `qsize()` 만으로는
+        "몇 개가 있었는지" 밖에 모르고 "어떤 PR 이었는지" 를 놓치는데, 드롭 대상 재시도
+        안내가 이 PR 의 핵심 목적이라 식별자가 필요.
+        """
+        with self._queue.mutex:
+            return list(self._queue.queue)
 
     # --- 서명 검증 ----------------------------------------------------------
 
@@ -142,6 +223,8 @@ class WebhookHandler:
 
     def _process(self, job: WebhookJob) -> None:
         dlog = get_delivery_logger(__name__, job.delivery_id)
+        with self._in_flight_lock:
+            self._in_flight = job
         try:
             dlog.info("processing %s#%d", job.repo.full_name, job.number)
             pr = self._github.fetch_pull_request(job.repo, job.number, job.installation_id)
@@ -152,3 +235,8 @@ class WebhookHandler:
             dlog.info("done %s#%d", job.repo.full_name, job.number)
         except Exception:
             dlog.exception("review failed for %s#%d", job.repo.full_name, job.number)
+        finally:
+            # in-flight 기록은 성공·실패·예외 모두에서 정확히 지워져야 stop() 시점의
+            # "드롭된 작업" 로그가 거짓 양성(false positive) 으로 안 찍힌다.
+            with self._in_flight_lock:
+                self._in_flight = None
