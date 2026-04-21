@@ -218,3 +218,44 @@ def test_review_does_not_fall_back_on_non_retryable_cli_failure(
         ).review(_sample_pr(), FileDump(entries=(), total_chars=0))
 
     assert [cmd[2] for cmd in calls] == ["gemini-3.1-pro-preview"]
+
+
+def test_review_falls_back_on_premature_stream_close(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """실관측 에러(`ERR_STREAM_PREMATURE_CLOSE`) 에서 fallback 모델로 넘어가는지 고정한다.
+
+    Gemini CLI 가 preview 모델 응답 스트림 도중 끊길 때 내는 에러. 모델/서버 쪽 일시
+    불안정이라 같은 모델 재시도보다 안정 모델로 폴백하는 편이 실효 있다.
+    """
+    calls: list[list[str]] = []
+
+    def fake_run(cmd: list[str], **_kwargs: Any) -> _FakeCompleted:
+        calls.append(cmd)
+        if len(calls) == 1:
+            return _FakeCompleted(
+                1,
+                stderr=(
+                    "Error when talking to Gemini API\n"
+                    "Error: Premature close\n"
+                    "code: 'ERR_STREAM_PREMATURE_CLOSE'"
+                ),
+            )
+        return _FakeCompleted(
+            0,
+            '{"summary": "recovered via fallback", "event": "COMMENT", "comments": []}',
+        )
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    result = GeminiCliEngine(
+        binary="gemini",
+        model="gemini-3.1-pro-preview",
+        fallback_models=("gemini-2.5-pro",),
+    ).review(_sample_pr(), FileDump(entries=(), total_chars=0))
+
+    assert [cmd[2] for cmd in calls] == [
+        "gemini-3.1-pro-preview",
+        "gemini-2.5-pro",
+    ]
+    assert result.summary == "recovered via fallback"
