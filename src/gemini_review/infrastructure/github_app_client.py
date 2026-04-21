@@ -175,12 +175,21 @@ class GitHubAppClient:
         *,
         auth: str,
         body: object | None = None,
-    ) -> list[Any]:
+    ) -> list[dict[str, Any]]:
+        # 최상위만 list 검증하면 배열 안에 dict 가 아닌 값이 섞였을 때 호출부의 `f["key"]` 에서
+        # 모호한 TypeError 가 난다. 경계에서 "list 이고 각 항목이 dict" 를 한 번에 보장하면
+        # 잘못된 GitHub 응답을 호출부가 아니라 여기서 명확한 메시지로 조기 실패시킬 수 있다.
         data = self._http(method, url, auth=auth, body=body)
         if not isinstance(data, list):
             raise RuntimeError(
                 f"expected JSON array from {method} {url}, got {type(data).__name__}"
             )
+        for i, item in enumerate(data):
+            if not isinstance(item, dict):
+                raise RuntimeError(
+                    f"expected JSON object at index {i} from {method} {url}, "
+                    f"got {type(item).__name__}"
+                )
         return data
 
     def _http(

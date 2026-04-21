@@ -4,7 +4,6 @@ import logging
 import queue
 import threading
 from dataclasses import dataclass
-from typing import Any
 
 from gemini_review.domain import RepoRef
 from gemini_review.interfaces import GitHubClient
@@ -72,14 +71,19 @@ class WebhookHandler:
         self,
         event: str,
         delivery_id: str,
-        payload: dict[str, Any],
+        payload: object,
     ) -> tuple[int, str]:
+        # payload 는 외부 JSON 경계에서 들어오므로 dict 가 아닐 수 있다(유효 HMAC + `[]` 등).
+        # 호출부가 타입을 좁혀 넘겨주는 것을 신뢰하지 않고 이 메서드 안에서 한 번 더 검증한다.
         dlog = get_delivery_logger(__name__, delivery_id)
         if event == "ping":
             return 200, "pong"
         if event != "pull_request":
             dlog.info("ignoring event: %s", event)
             return 202, "ignored"
+        if not isinstance(payload, dict):
+            dlog.warning("payload is not a JSON object: %s", type(payload).__name__)
+            return 400, "invalid-payload-shape"
 
         action = str(payload.get("action", ""))
         if action not in _SUPPORTED_ACTIONS:

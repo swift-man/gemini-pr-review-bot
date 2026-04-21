@@ -124,6 +124,25 @@ def test_accept_ignores_non_pr_events(tmp_path: Path) -> None:
     assert code == 202
 
 
+def test_accept_rejects_non_dict_payload(tmp_path: Path) -> None:
+    """유효 서명 + JSON 이지만 최상위가 배열/프리미티브인 경우 400 으로 조기 실패.
+
+    `payload: object` 로 느슨히 받은 뒤 isinstance 검증으로 좁히는 계약을 고정한다.
+    회귀 방지: 이 검증을 잃으면 `payload.get(...)` 에서 AttributeError → 500 으로
+    이어져 악의적 입력이 서버 오류로 잡힌다.
+    """
+    handler = _build_handler(
+        FakeGitHub(),
+        FileDump(entries=(), total_chars=0),
+        ReviewResult(summary="ok", event=ReviewEvent.COMMENT),
+        tmp_path,
+    )
+    for bogus in (["not", "a", "dict"], "string", 42, None):
+        code, reason = handler.accept("pull_request", "dbogus", bogus)
+        assert code == 400, f"expected 400 for {type(bogus).__name__}, got {code}"
+        assert reason == "invalid-payload-shape"
+
+
 def test_accept_ignores_draft(tmp_path: Path) -> None:
     handler = _build_handler(
         FakeGitHub(),
