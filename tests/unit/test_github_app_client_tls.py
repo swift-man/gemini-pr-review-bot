@@ -79,3 +79,45 @@ def test_default_tls_context_factory_is_fresh_instance() -> None:
     a = github_app_client._default_tls_context()
     b = github_app_client._default_tls_context()
     assert a is not b
+
+
+def _stub_response(monkeypatch: pytest.MonkeyPatch, payload: bytes) -> None:
+    """HTTP 경로를 stub 해서 `_request_*` 경계 검증만 단독으로 테스트한다."""
+    monkeypatch.setattr(
+        urllib.request,
+        "urlopen",
+        lambda *_a, **_k: _FakeResponse(payload),
+    )
+
+
+def test_request_list_raises_when_response_is_not_array(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """GitHub 가 배열을 약속한 엔드포인트에서 객체/프리미티브를 반환하면 즉시 실패해야 한다."""
+    _stub_response(monkeypatch, b'{"message": "rate limited"}')
+    client = GitHubAppClient(app_id=1, private_key_pem="-")
+
+    with pytest.raises(RuntimeError, match="expected JSON array"):
+        client._request_list("GET", "https://api.github.com/x", auth="token t")
+
+
+def test_request_list_raises_when_item_is_not_object(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """배열이지만 내부에 dict 가 아닌 값이 섞이면 호출부의 `f["key"]` 전에 조기 실패."""
+    _stub_response(monkeypatch, b'[{"filename": "a.py"}, "broken"]')
+    client = GitHubAppClient(app_id=1, private_key_pem="-")
+
+    with pytest.raises(RuntimeError, match="expected JSON object at index 1"):
+        client._request_list("GET", "https://api.github.com/x", auth="token t")
+
+
+def test_request_object_raises_when_response_is_array(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """객체를 기대하는 엔드포인트에서 배열이 오면 마찬가지로 조기 실패."""
+    _stub_response(monkeypatch, b'[1, 2, 3]')
+    client = GitHubAppClient(app_id=1, private_key_pem="-")
+
+    with pytest.raises(RuntimeError, match="expected JSON object"):
+        client._request_object("GET", "https://api.github.com/x", auth="token t")
