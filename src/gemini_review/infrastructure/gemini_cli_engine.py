@@ -10,6 +10,18 @@ from .gemini_prompt import build_prompt
 
 logger = logging.getLogger(__name__)
 
+_STDIN_PROMPT_PLACEHOLDER = " "
+_DEFAULT_FALLBACK_MODELS = ("gemini-2.5-pro",)
+_RETRYABLE_MODEL_FAILURE_MARKERS = (
+    "429",
+    "model_capacity_exhausted",
+    "no capacity available",
+    "rate limit exceeded",
+    "ratelimitexceeded",
+    "resource_exhausted",
+    "too many requests",
+)
+
 
 class GeminiAuthError(RuntimeError):
     """Raised when the Gemini CLI is not authenticated with Google OAuth."""
@@ -27,11 +39,13 @@ class GeminiCliEngine:
         self,
         binary: str = "gemini",
         model: str = "gemini-2.5-pro",
+        fallback_models: tuple[str, ...] = _DEFAULT_FALLBACK_MODELS,
         timeout_sec: int = 600,
         oauth_creds_path: Path | None = None,
     ) -> None:
         self._binary = binary
         self._model = model
+        self._fallback_models = fallback_models
         self._timeout_sec = timeout_sec
         # 기본값은 Gemini CLI 가 생성하는 표준 위치. 테스트/커스텀 설치 경로는 DI 로 교체 가능.
         self._oauth_creds_path = oauth_creds_path or Path.home() / ".gemini" / "oauth_creds.json"
@@ -100,23 +114,56 @@ class GeminiCliEngine:
 
     def review(self, pr: PullRequest, dump: FileDump) -> ReviewResult:
         prompt = build_prompt(pr, dump)
-        # `-p` (prompt) 모드에서 stdin 으로 프롬프트를 흘려 보낸다.
-        # argv 로 넘기지 않는 이유는 전체 레포 덤프가 수백 KB ~ 수 MB 라 ARG_MAX 를 초과할 수 있어서.
+        models = _dedupe_models(self._model, self._fallback_models)
+        last_error = ""
+        for index, model in enumerate(models):
+            result = self._invoke_review(model, prompt, dump)
+            if result.returncode == 0:
+                return parse_review(result.stdout)
+
+            last_error = _combined_output(result)
+            has_fallback = index + 1 < len(models)
+            if has_fallback and _is_retryable_model_failure(last_error):
+                fallback = models[index + 1]
+                logger.warning(
+                    "gemini model failed; falling back from %s to %s: %s",
+                    model,
+                    fallback,
+                    last_error[:500],
+                )
+                continue
+
+            raise RuntimeError(_failure_message(model, result.returncode, last_error))
+
+        # `_dedupe_models` 는 최소 primary 모델 하나를 보장한다. 이 분기는 타입 체커와 미래의
+        # 방어적 변경을 위한 안전망이다.
+        raise RuntimeError(f"gemini -p failed: {last_error[:1000] or '(empty)'}")
+
+    def _invoke_review(
+        self,
+        model: str,
+        prompt: str,
+        dump: FileDump,
+    ) -> subprocess.CompletedProcess[str]:
+        # Gemini CLI 0.38.x 는 `-p/--prompt` 뒤에 문자열 인자를 요구한다. 실제 전체 레포
+        # 프롬프트는 계속 stdin 으로 흘려 보내 ARG_MAX 를 피하고, argv 에는 non-empty
+        # placeholder 만 둔다.
         # `-m` 은 모델 오버라이드. Gemini CLI 는 별도 reasoning-effort 플래그가 없어 생략.
         cmd = [
             self._binary,
             "-m",
-            self._model,
+            model,
             "-p",
+            _STDIN_PROMPT_PLACEHOLDER,
         ]
         logger.info(
             "invoking gemini: files=%d chars=%d model=%s",
             len(dump.entries),
             dump.total_chars,
-            self._model,
+            model,
         )
         try:
-            result = subprocess.run(  # noqa: S603
+            return subprocess.run(  # noqa: S603
                 cmd,
                 input=prompt,
                 capture_output=True,
@@ -129,9 +176,30 @@ class GeminiCliEngine:
                 f"gemini -p timed out after {self._timeout_sec}s"
             ) from exc
 
-        if result.returncode != 0:
-            raise RuntimeError(
-                f"gemini -p failed ({result.returncode}): {result.stderr.strip()[:1000]}"
-            )
 
-        return parse_review(result.stdout)
+def _dedupe_models(primary: str, fallback_models: tuple[str, ...]) -> tuple[str, ...]:
+    seen: set[str] = set()
+    models: list[str] = []
+    for model in (primary, *fallback_models):
+        clean = model.strip()
+        if clean and clean not in seen:
+            seen.add(clean)
+            models.append(clean)
+    return tuple(models) or (primary,)
+
+
+def _combined_output(result: subprocess.CompletedProcess[str]) -> str:
+    return (result.stderr + "\n" + result.stdout).strip()
+
+
+def _is_retryable_model_failure(output: str) -> bool:
+    lower = output.lower()
+    if any(marker in lower for marker in _RETRYABLE_MODEL_FAILURE_MARKERS):
+        return True
+    if "preview" not in lower:
+        return False
+    return any(marker in lower for marker in ("not found", "not supported", "unavailable"))
+
+
+def _failure_message(model: str, returncode: int, output: str) -> str:
+    return f"gemini -p failed with model {model} ({returncode}): {output[:1000]}"

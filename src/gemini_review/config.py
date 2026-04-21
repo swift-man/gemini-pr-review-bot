@@ -19,6 +19,10 @@ class Settings(BaseSettings):
     # Gemini CLI
     gemini_bin: str = Field(default="gemini", alias="GEMINI_BIN")
     gemini_model: str = Field(default="gemini-2.5-pro", alias="GEMINI_MODEL")
+    gemini_fallback_models: str = Field(
+        default="gemini-2.5-pro",
+        alias="GEMINI_FALLBACK_MODELS",
+    )
     gemini_timeout_sec: int = Field(default=600, alias="GEMINI_TIMEOUT_SEC")
     gemini_max_input_tokens: int = Field(default=900_000, alias="GEMINI_MAX_INPUT_TOKENS")
     # Google OAuth 자격 증명 파일 — gemini CLI 의 `gemini auth login` 결과 위치.
@@ -47,4 +51,11 @@ class Settings(BaseSettings):
             return self.github_app_private_key_path.read_text(encoding="utf-8")
         raise RuntimeError(
             "GITHUB_APP_PRIVATE_KEY 또는 GITHUB_APP_PRIVATE_KEY_PATH 중 하나가 필요합니다."
+        )
+
+    def parsed_gemini_fallback_models(self) -> tuple[str, ...]:
+        return tuple(
+            model.strip()
+            for model in self.gemini_fallback_models.split(",")
+            if model.strip()
         )

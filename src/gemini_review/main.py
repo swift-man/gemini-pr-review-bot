@@ -1,7 +1,7 @@
 import json
 import logging
+from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
-from typing import AsyncIterator
 
 from fastapi import FastAPI, Request, Response
 
@@ -32,12 +32,14 @@ def build_handler(settings: Settings) -> WebhookHandler:
     engine = GeminiCliEngine(
         binary=settings.gemini_bin,
         model=settings.gemini_model,
+        fallback_models=settings.parsed_gemini_fallback_models(),
         timeout_sec=settings.gemini_timeout_sec,
         oauth_creds_path=settings.gemini_oauth_creds_path,
     )
 
-    # 기동 시 Gemini CLI + Google OAuth 자격 상태를 선점검. 토큰이 살아 있으면 로그만 남기고 통과,
-    # 없으면 서버 기동 자체를 중단시켜 운영자가 `gemini` 로 브라우저 로그인을 먼저 돌리도록 유도한다.
+    # 기동 시 Gemini CLI + Google OAuth 자격 상태를 선점검. 토큰이 살아 있으면 로그만
+    # 남기고 통과, 없으면 서버 기동 자체를 중단시켜 운영자가 `gemini` 로 브라우저
+    # 로그인을 먼저 돌리도록 유도한다.
     try:
         status_line = engine.verify_auth()
         logger.info("gemini auth OK — %s", status_line)
