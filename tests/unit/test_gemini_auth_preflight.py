@@ -6,7 +6,11 @@ from typing import Any
 import pytest
 
 from gemini_review.domain import FileDump, PullRequest, RepoRef
-from gemini_review.infrastructure.gemini_cli_engine import GeminiAuthError, GeminiCliEngine
+from gemini_review.infrastructure.gemini_cli_engine import (
+    _is_retryable_model_failure,
+    GeminiAuthError,
+    GeminiCliEngine,
+)
 
 
 class _FakeCompleted:
@@ -259,3 +263,24 @@ def test_review_falls_back_on_premature_stream_close(
         "gemini-2.5-pro",
     ]
     assert result.summary == "recovered via fallback"
+
+
+def test_stream_close_markers_are_not_redundant() -> None:
+    """`premature close` 와 `err_stream_premature_close` 는 서로 다른 출력 형태를 잡는다.
+
+    회귀 방지: 두 마커가 중복처럼 보여 누군가 한 쪽을 지우면 실제 관측되는 Node.js
+    출력 형태 중 하나가 마킹을 빠져나간다. 매칭은 부분 문자열 기반이므로 공백 vs
+    언더스코어 차이로 서로를 포함하지 않는다는 사실을 테스트로 고정한다.
+    """
+    prose_form = "Error: Premature close"  # Node.js 가 사람이 읽는 메시지로 내는 형태
+    code_form = "code: 'ERR_STREAM_PREMATURE_CLOSE'"  # code 필드의 상수 형태
+
+    # 양쪽 다 retryable 로 인식돼야 한다 (fallback 경로 발동)
+    assert _is_retryable_model_failure(prose_form) is True
+    assert _is_retryable_model_failure(code_form) is True
+
+    # 구조적 이유로 둘은 서로를 포함하지 않는다 (공백 vs 언더스코어):
+    # "premature close" not in "err_stream_premature_close" 이고 반대도 성립하지 않는다.
+    # 따라서 두 마커 중 하나만 남기면 나머지 형태는 커버리지에서 빠진다.
+    assert "premature close" not in code_form.lower()
+    assert "err_stream_premature_close" not in prose_form.lower()
