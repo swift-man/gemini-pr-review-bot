@@ -66,3 +66,62 @@ def test_render_body_omits_model_footer_when_model_is_none() -> None:
     assert "리뷰 생성 모델" not in body
     assert "---" not in body
     assert body == "요약"
+
+
+def test_render_body_replaces_misleading_footer_when_inline_comments_dropped() -> None:
+    """findings 가 비어 있고 dropped_inline_count>0 이면 솔직한 안내 문구를 찍는다.
+
+    회귀 방지: 422 retry 경로에서 본문이 "_N건 표시_" 라고 거짓말한 채 게시되어 PR
+    리뷰 수신자에게 혼란을 주던 실관측 버그(MLX#27 등) 의 재발을 막는다. 이 테스트는
+    render_body 단계에서 거짓 진술이 사라지고 정확한 사실로 대체되는지를 고정한다.
+    """
+    result = ReviewResult(
+        summary="요약",
+        event=ReviewEvent.REQUEST_CHANGES,
+        positives=("좋음",),
+        # findings 는 비어 있음 — POST 직전에 외부에서 비웠다고 가정
+    )
+    body = result.render_body(dropped_inline_count=3)
+
+    # 거짓 진술 부재
+    assert "기술 단위 코멘트 3건은 각 라인에 별도 표시" not in body
+    # 솔직한 사실 진술
+    assert "3개 인라인 코멘트" in body
+    assert "diff 범위 밖" in body
+    # 본문 다른 섹션은 보존
+    assert "**좋은 점**" in body
+    assert "- 좋음" in body
+
+
+def test_render_body_default_dropped_count_zero_does_not_add_notice() -> None:
+    """기본 호출(=0) 에서는 안내 문구가 추가되지 않는다 — 하위 호환 보장."""
+    result = ReviewResult(
+        summary="요약",
+        event=ReviewEvent.COMMENT,
+    )
+    body = result.render_body()
+
+    assert "diff 범위 밖" not in body
+    assert "거부되어" not in body
+
+
+def test_render_body_dropped_count_overrides_findings_footer() -> None:
+    """dropped_inline_count > 0 이면 self.findings 가 있어도 안내 문구로 덮어쓴다.
+
+    실 사용처(github_app_client retry) 에서 호출자는 같은 result 객체를 그대로 넘기지만
+    "이 inline 들은 게시되지 않았다" 는 사실을 dropped_inline_count 로 알린다.
+    findings 비우기 위해 dataclasses.replace 를 강제하지 않아도 동작이 정확하도록 한
+    설계 결정 — 호출 단순성과 본문 정확성을 동시에 보장한다.
+    """
+    result = ReviewResult(
+        summary="요약",
+        event=ReviewEvent.COMMENT,
+        findings=(Finding(path="a.py", line=5, body="[Major] x"),),
+    )
+    body = result.render_body(dropped_inline_count=1)
+
+    # 거짓 footer 부재 — findings 가 있어도 안내가 우선
+    assert "기술 단위 코멘트 1건은 각 라인에 별도 표시" not in body
+    # 솔직한 안내가 그 자리를 차지
+    assert "1개 인라인 코멘트" in body
+    assert "diff 범위 밖" in body

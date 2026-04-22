@@ -216,11 +216,27 @@ def test_post_review_drops_inline_comments_and_retries_on_422(
     assert posted_bodies[0]["comments"][0]["path"] == "a.py"
     assert posted_bodies[0]["comments"][0]["line"] == 42
 
-    # 2차: comments 비워졌지만 body 와 기타 필드는 동일 (본문 보존)
+    # 2차: comments 비워지고 body 도 재렌더 — 1차의 거짓 footer ("N건 표시") 가
+    # 솔직한 안내 ("N개 거부됨") 로 교체됐는지 확인. commit_id/event 등 다른 필드는 동일.
     assert posted_bodies[1]["comments"] == []
-    assert posted_bodies[1]["body"] == posted_bodies[0]["body"]
     assert posted_bodies[1]["commit_id"] == posted_bodies[0]["commit_id"]
     assert posted_bodies[1]["event"] == posted_bodies[0]["event"]
+
+    body_initial = str(posted_bodies[0]["body"])
+    body_retry = str(posted_bodies[1]["body"])
+
+    # 1차는 거짓 진술이 있었다 (실제 게시 단계에서 inline 코멘트가 살아남는다고 약속)
+    assert "기술 단위 코멘트 1건은 각 라인에 별도 표시됩니다" in body_initial
+
+    # 2차에선 그 진술이 제거되고 솔직한 사실 안내로 대체
+    assert "기술 단위 코멘트 1건은 각 라인에 별도 표시됩니다" not in body_retry
+    assert "1개 인라인 코멘트" in body_retry
+    assert "diff 범위 밖" in body_retry
+
+    # 본문의 다른 섹션 (요약/positives/improvements) 은 보존돼야 함
+    assert "요약" in body_retry
+    assert "**좋은 점**" in body_retry
+    assert "**개선할 점**" in body_retry
 
 
 def test_post_review_does_not_retry_when_no_comments(
