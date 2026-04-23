@@ -29,11 +29,17 @@ class GitRepoFetcher:
             # 설치 토큰은 1시간마다 바뀌므로 기존 remote URL 의 토큰을 교체해야 fetch 가 성공한다.
             _run(["git", "-C", str(repo_path), "remote", "set-url", "origin", authed_url])
 
-        # depth=1 로 head SHA 만 얕게 받아 네트워크/디스크 비용을 최소화. 전체 히스토리가 필요
+        # depth=1 로 PR 스냅샷만 얕게 받아 네트워크/디스크 비용을 최소화. 전체 히스토리가 필요
         # 없는 리뷰 용도에 충분하다.
-        _run(["git", "-C", str(repo_path), "fetch", "--depth", "1", "origin", pr.head_sha])
+        # `effective_fetch_ref()` 는 보통 `head_sha` 지만, fork 가 삭제된 PR 의 경우
+        # `refs/pull/{n}/head` 를 반환해 base 저장소의 GitHub PR ref 로 PR 스냅샷을
+        # 받을 수 있게 한다 (`fetch_pull_request` 의 `_resolve_fetch_source` 가 결정).
+        # PR ref fetch 시엔 결과 SHA 가 `FETCH_HEAD` 에 들어가므로 checkout 도 그쪽으로.
+        fetch_ref = pr.effective_fetch_ref()
+        _run(["git", "-C", str(repo_path), "fetch", "--depth", "1", "origin", fetch_ref])
+        checkout_target = "FETCH_HEAD" if fetch_ref != pr.head_sha else pr.head_sha
         # --force: 이전 리뷰에서 남은 local modification 이 있어도 무시하고 대상 SHA 로 전환.
-        _run(["git", "-C", str(repo_path), "checkout", "--force", pr.head_sha])
+        _run(["git", "-C", str(repo_path), "checkout", "--force", checkout_target])
         # -fdx: 추적되지 않는 파일/디렉터리/ignore 대상까지 전부 제거해 이전 체크아웃의 잔여물이
         # 리뷰 입력에 섞이지 않도록 한다.
         _run(["git", "-C", str(repo_path), "clean", "-fdx"])

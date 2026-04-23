@@ -593,10 +593,17 @@ def test_fetch_pull_request_falls_back_to_base_repo_when_head_fork_deleted(
 
     # fallback URL 이 박혀야 (head URL 에는 접근 불가능했으므로)
     assert pr.clone_url == "https://base/x.git"
-    # 운영 관측 WARN — "fork 삭제된 PR" 빈도 추적 가능
+    # fetch_ref 도 함께 전환돼야 — base repo 에서는 head_sha 직접 fetch 가 막힐 수 있고
+    # PR ref 만 PR 스냅샷에 도달 가능 (codex PR #21 review #1).
+    assert pr.fetch_ref == "refs/pull/9/head", (
+        "fork 삭제 fallback 시 fetch_ref 도 PR ref 로 전환돼야 GitRepoFetcher 가 "
+        "base repo 에서 PR 스냅샷을 받을 수 있다"
+    )
+    # 운영 관측 WARN — "fork 삭제된 PR" 빈도 추적 가능, ref 도 메시지에 포함
     warns = [r for r in caplog.records if "deleted fork" in r.getMessage()]
     assert len(warns) == 1, "fallback 발생 시 WARN 한 줄이 남아야 한다"
     assert "o/r" in warns[0].getMessage() and "#9" in warns[0].getMessage()
+    assert "refs/pull/9/head" in warns[0].getMessage()
 
 
 def test_fetch_pull_request_falls_back_when_head_repo_missing_clone_url(
@@ -620,6 +627,7 @@ def test_fetch_pull_request_falls_back_when_head_repo_missing_clone_url(
         pr = client.fetch_pull_request(RepoRef("o", "r"), 9, installation_id=7)
 
     assert pr.clone_url == "https://base/x.git"
+    assert pr.fetch_ref == "refs/pull/9/head"
     assert any("deleted fork" in r.getMessage() for r in caplog.records)
 
 
@@ -645,6 +653,8 @@ def test_fetch_pull_request_uses_head_clone_url_in_normal_case(
         pr = client.fetch_pull_request(RepoRef("o", "r"), 9, installation_id=7)
 
     assert pr.clone_url == "https://fork/x.git", "정상 케이스엔 head URL 이 박혀야"
+    # 정상 케이스: fetch_ref == head_sha (PR ref 로 전환되면 안 됨)
+    assert pr.fetch_ref == pr.head_sha, "정상 케이스엔 fetch_ref 가 head_sha 와 동일해야"
     deleted_fork_warns = [r for r in caplog.records if "deleted fork" in r.getMessage()]
     assert deleted_fork_warns == [], "정상 케이스엔 fallback WARN 이 없어야 한다"
 
