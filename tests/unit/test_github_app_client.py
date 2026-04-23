@@ -499,7 +499,8 @@ def test_fetch_pull_request_collects_addable_lines_with_single_files_call(
 
     회귀 방지: 이걸 두 번 나눠 호출하면 (1) 라운드트립 낭비 (2) race condition 위험
     (두 번째 호출이 새 head_sha 의 patch 를 받을 수 있음). 한 호출에서 함께 처리하는
-    것이 일관성 보장의 핵심.
+    것이 일관성 보장의 핵심. (/pulls 는 head_sha 일관성 재확인 때문에 2회 호출됨 —
+    별도의 race 테스트에서 검증.)
     """
     files_call_count = 0
 
@@ -533,7 +534,7 @@ def test_fetch_pull_request_collects_addable_lines_with_single_files_call(
     client = GitHubAppClient(app_id=1, private_key_pem="-")
     pr = client.fetch_pull_request(RepoRef("o", "r"), 9, installation_id=7)
 
-    # 단일 호출 — 두 번 부르면 race condition 위험
+    # 단일 /files 호출 — 두 번 부르면 race condition 위험
     assert files_call_count == 1
 
     # changed_files 와 addable_lines 모두 채워졌어야
@@ -544,8 +545,520 @@ def test_fetch_pull_request_collects_addable_lines_with_single_files_call(
     assert addable["binary.png"] == frozenset()
 
 
+def _build_fake_urlopen_for_fetch_pr(
+    *,
+    head_shas: list[str],
+    files_payload: bytes = b'[{"filename": "src/a.py", "patch": "@@ -1,0 +5,2 @@\\n+x\\n+y\\n"}]',
+    counters: dict[str, int] | None = None,
+):
+    """fetch_pull_request race-condition 테스트용 urlopen 빌더.
+
+    `head_shas` 는 `/pulls/{n}` 호출이 매번 어떤 head_sha 를 반환할지 순서대로 지정.
+    반복 시 마지막 값을 계속 사용 (테스트가 시도 횟수보다 짧은 리스트를 줘도 안전).
+    """
+    if counters is None:
+        counters = {"pulls": 0, "files": 0}
+
+    def fake_urlopen(
+        req: urllib.request.Request,
+        *,
+        timeout: float | None = None,
+        context: ssl.SSLContext | None = None,
+    ) -> _FakeResponse:
+        if "access_tokens" in req.full_url:
+            return _FakeResponse(b'{"token": "tkn", "expires_at": ""}')
+        if "/files" in req.full_url:
+            counters["files"] += 1
+            return _FakeResponse(files_payload)
+        # /pulls/{n} 메타데이터 — head_sha 만 시퀀스에 따라 바꾸고 나머진 고정
+        idx = min(counters["pulls"], len(head_shas) - 1)
+        sha = head_shas[idx]
+        counters["pulls"] += 1
+        return _FakeResponse(json.dumps({
+            "title": "t",
+            "body": "b",
+            "draft": False,
+            "head": {"sha": sha, "ref": "feat", "repo": {"clone_url": "https://x.git"}},
+            "base": {"sha": "def", "ref": "main"},
+        }).encode())
+
+    return fake_urlopen, counters
+
+
+def test_fetch_pull_request_rechecks_head_sha_after_files(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`/files` 직후 `/pulls/{n}` 을 다시 짚어 head_sha 가 그대로인지 확인해야 한다.
+
+    회귀 방지: 이 재확인이 빠지면 `/pulls/{n}` 과 `/files` 사이 사용자가 push 한
+    경우 head_sha 는 옛 SHA, addable_lines 는 새 SHA 의 것이라 라인 분할이 어긋나
+    잘못된 위치에 인라인 코멘트가 붙는다.
+    """
+    fake, counters = _build_fake_urlopen_for_fetch_pr(head_shas=["abc"])
+    monkeypatch.setattr(urllib.request, "urlopen", fake)
+    monkeypatch.setattr(jwt, "encode", lambda *a, **k: "fake.jwt")
+
+    client = GitHubAppClient(app_id=1, private_key_pem="-")
+    pr = client.fetch_pull_request(RepoRef("o", "r"), 9, installation_id=7)
+
+    # /pulls/{n} 호출 3회: (1) initial, (2) post-page check (첫 페이지 응답 직후 검증,
+    # codex PR #19 review #7), (3) final recheck. 검증 호출이 누락되면 3 → 2 로 떨어져
+    # 이 assertion 이 잡아낸다.
+    assert counters["pulls"] == 3, "head_sha 일관성 재확인 호출이 누락됐다"
+    assert counters["files"] == 1, "정상 케이스에선 /files 가 한 번만 호출돼야 한다"
+    assert pr.head_sha == "abc"
+
+
+def test_fetch_pull_request_normalizes_null_title_and_body_to_empty_string(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """GitHub 응답에서 title/body 가 `null` 이면 빈 문자열로 매핑.
+
+    회귀 방지 (gemini PR #19 review #2): `dict.get("title", "")` 는 키가 존재하고 값이
+    None 이면 None 을 반환한다. 그 결과 `str(None) == "None"` 이 PullRequest.title 에
+    박혀 다운스트림 (프롬프트, 본문 surface 등) 에 "None" 이 노출되는 회귀가 생긴다.
+    `or ""` 패턴으로 None 도 안전하게 빈 문자열로 처리해야 한다.
+    """
+
+    def fake_urlopen(
+        req: urllib.request.Request,
+        *,
+        timeout: float | None = None,
+        context: ssl.SSLContext | None = None,
+    ) -> _FakeResponse:
+        if "access_tokens" in req.full_url:
+            return _FakeResponse(b'{"token": "tkn", "expires_at": ""}')
+        if "/files" in req.full_url:
+            return _FakeResponse(
+                b'[{"filename": "a.py", "patch": "@@ -1,0 +1,1 @@\\n+x\\n"}]'
+            )
+        # title 과 body 모두 명시적 null — 빈 본문 PR 이 GitHub 에서 이런 응답을 준다.
+        return _FakeResponse(json.dumps({
+            "title": None,
+            "body": None,
+            "draft": False,
+            "head": {"sha": "abc", "ref": "feat", "repo": {"clone_url": "https://x.git"}},
+            "base": {"sha": "def", "ref": "main"},
+        }).encode())
+
+    monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+    monkeypatch.setattr(jwt, "encode", lambda *a, **k: "fake.jwt")
+
+    client = GitHubAppClient(app_id=1, private_key_pem="-")
+    pr = client.fetch_pull_request(RepoRef("o", "r"), 9, installation_id=7)
+
+    # "None" 문자열이 박히면 회귀 — 빈 문자열이어야
+    assert pr.title == "", "null title 은 빈 문자열로 매핑돼야 (str(None) 회귀 방지)"
+    assert pr.body == "", "null body 도 빈 문자열로 매핑돼야"
+
+
+def test_fetch_pull_request_uses_recheck_metadata_when_head_sha_matches(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """head_sha 동일하면 더 신선한 `recheck` 응답의 메타데이터(title/body/draft)를 채택.
+
+    회귀 방지 (gemini PR #19 review #2): fetch 도중 사용자가 head 는 안 바꾸고 PR 본문/
+    제목/draft 상태만 갱신하는 경우, `pr_data` 기준으로 PullRequest 를 만들면 옛 메타가
+    박힌다. head_sha 가 같다는 것은 changed/addable 일관성만 보장하면 되고, 메타는 더
+    신선한 쪽을 쓰는 게 자연스럽다.
+    """
+    pulls_call_count = 0
+
+    def fake_urlopen(
+        req: urllib.request.Request,
+        *,
+        timeout: float | None = None,
+        context: ssl.SSLContext | None = None,
+    ) -> _FakeResponse:
+        nonlocal pulls_call_count
+        if "access_tokens" in req.full_url:
+            return _FakeResponse(b'{"token": "tkn", "expires_at": ""}')
+        if "/files" in req.full_url:
+            return _FakeResponse(
+                b'[{"filename": "src/a.py", "patch": "@@ -1,0 +5,2 @@\\n+x\\n+y\\n"}]'
+            )
+        # /pulls/{n}: 첫 호출 = 옛 메타, 두 번째 호출 = 새 메타 (head_sha 동일).
+        pulls_call_count += 1
+        is_initial = pulls_call_count == 1
+        return _FakeResponse(json.dumps({
+            "title": "옛 제목" if is_initial else "새 제목",
+            "body": "옛 본문" if is_initial else "새 본문",
+            "draft": True if is_initial else False,
+            "head": {"sha": "abc", "ref": "feat", "repo": {"clone_url": "https://x.git"}},
+            "base": {"sha": "def", "ref": "main"},
+        }).encode())
+
+    monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+    monkeypatch.setattr(jwt, "encode", lambda *a, **k: "fake.jwt")
+
+    client = GitHubAppClient(app_id=1, private_key_pem="-")
+    pr = client.fetch_pull_request(RepoRef("o", "r"), 9, installation_id=7)
+
+    # head_sha 동일성은 유지
+    assert pr.head_sha == "abc"
+    # 메타데이터는 두 번째(recheck) 응답 기준 — 옛 메타가 박히면 회귀
+    assert pr.title == "새 제목"
+    assert pr.body == "새 본문"
+    assert pr.is_draft is False
+
+
+def test_fetch_pull_request_retries_when_head_sha_changes_mid_fetch(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """fetch 시작-끝 사이 head_sha 가 바뀌면 재시도해 일관된 스냅샷을 얻어야 한다.
+
+    회귀 방지: 재시도 로직이 빠지면 첫 시도의 어긋난 데이터를 그대로 PullRequest 에
+    박아 후속 인라인 분할이 깨진다. 두 번째 시도에서 head_sha 가 안정되면 그 SHA 의
+    일관된 스냅샷으로 정상 반환해야 한다.
+
+    시나리오는 **start/end 모드** 를 deliberately 발동 — 단일 페이지 PR 에서 post-page
+    check 는 match 하되 final recheck 에서 mismatch. mid-pagination 과 분리된 경로.
+    """
+    # 시나리오:
+    #   1차: pulls=abc (initial) → files → pulls=abc (post-page, match) → pulls=def (recheck, mismatch)
+    #        → retry, pr_data = recheck (def)
+    #   2차: (carried pr_data, sha=def) → files → pulls=def (post-page) → pulls=def (recheck, match)
+    #        → return
+    fake, counters = _build_fake_urlopen_for_fetch_pr(
+        head_shas=["abc", "abc", "def", "def", "def"]
+    )
+    monkeypatch.setattr(urllib.request, "urlopen", fake)
+    monkeypatch.setattr(jwt, "encode", lambda *a, **k: "fake.jwt")
+
+    client = GitHubAppClient(app_id=1, private_key_pem="-")
+    with caplog.at_level(logging.WARNING):
+        pr = client.fetch_pull_request(RepoRef("o", "r"), 9, installation_id=7)
+
+    # /pulls 호출 5회: 1차 (initial + post-page + recheck) + 2차 carry init skip
+    # (post-page + recheck) = 3+2 = 5. recheck 재사용 최적화가 깨지면 6+ 이 될 것.
+    assert counters["pulls"] == 5
+    assert counters["files"] == 2
+    # 두 번째 시도의 안정된 SHA 가 박혀야 한다
+    assert pr.head_sha == "def"
+
+    # WARN 로그가 운영 관측 — race 가 일어났음을 운영자가 알 수 있어야
+    warns = [r for r in caplog.records if "head_sha changed" in r.getMessage()]
+    assert len(warns) == 1, "head_sha race 발생 시 WARN 한 줄이 남아야 한다"
+    assert "abc" in warns[0].getMessage() and "def" in warns[0].getMessage()
+
+
+def test_fetch_pull_request_raises_when_head_sha_keeps_changing(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """매 시도마다 start/end 모드로 실패하면 무한 retry 대신 명시적 실패.
+
+    조용히 잘못된 데이터로 진행하는 것이 가장 위험한 실패 모드 — 차라리 webhook 큐
+    수준에서 빼버리고 다음 push 의 새 webhook 이 새 시작점이 되도록 하는 게 안전.
+
+    회귀 방지:
+    - 마지막 시도에서 "retrying" 로그가 더 안 찍히는지 (gemini PR #19 review #2)
+    - 실패 메시지가 fetch 시작-끝 모드임을 명시 (codex PR #19 review #4) — ABA 페이지
+      race 와 다른 디버깅 경로이므로 진단 메시지가 구분돼야
+    - `__cause__` is None (mid-pagination 예외 미발생 시 chain 안 됨)
+
+    시나리오: 단일 페이지 PR 에서 post-page 는 match 하되 매 attempt 의 final recheck
+    에서 mismatch. 즉 race 가 fetch 시작-끝 구간에서만 발생하는 경우.
+    """
+    # 매 attempt 에서 post-page 는 초기 SHA 와 match, final recheck 는 다른 SHA 로.
+    # 시퀀스: [init1, post1, recheck1, post2(after carry), recheck2, post3, recheck3]
+    fake, _counters = _build_fake_urlopen_for_fetch_pr(
+        head_shas=["s1", "s1", "s2", "s2", "s3", "s3", "s4"]
+    )
+    monkeypatch.setattr(urllib.request, "urlopen", fake)
+    monkeypatch.setattr(jwt, "encode", lambda *a, **k: "fake.jwt")
+
+    client = GitHubAppClient(app_id=1, private_key_pem="-")
+    with caplog.at_level(logging.WARNING):
+        with pytest.raises(RuntimeError, match="head_sha kept changing") as exc_info:
+            client.fetch_pull_request(RepoRef("o", "r"), 9, installation_id=7)
+
+    # 진단 메시지: fetch 시작-끝 SHA 변동. post-page 는 매번 match 했으므로 mid-pagination
+    # 경로는 한 번도 안 밟음.
+    assert "fetch start/end SHA mismatch" in str(exc_info.value)
+    # ABA cause 가 chain 되면 안 됨 (mid-pagination 예외 미발생)
+    assert exc_info.value.__cause__ is None, (
+        "mid-pagination 예외가 발생하지 않았으니 cause chain 도 없어야"
+    )
+
+    # _MAX_FETCH_ATTEMPTS=3 → 1차·2차 mismatch 시 "retrying" 로그, 3차는 곧바로 raise.
+    retry_warns = [r for r in caplog.records if "retrying attempt" in r.getMessage()]
+    assert len(retry_warns) == 2, (
+        "마지막 시도에선 retry 로그가 찍히면 안 된다 — 곧바로 RuntimeError 로 빠진다"
+    )
+
+
+def test_fetch_pull_request_chains_mid_pagination_cause_when_exhausted(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """ABA 페이지 race 가 매 시도마다 반복돼 exhaustion 으로 끝나면, 마지막 ABA
+    예외가 RuntimeError 의 `__cause__` 로 chain 되고 메시지에 mode 가 표기돼야 한다.
+
+    회귀 방지 (codex PR #19 review #4): mid-pagination 모드와 fetch 시작-끝 모드는
+    디버깅 액션이 다르다 — 전자는 페이지네이션 중간 체크 로직, 후자는 단일 시점 race.
+    같은 메시지로 묶이면 운영자가 잘못된 방향으로 진단을 시작할 수 있다.
+
+    시나리오: ABA 시퀀스를 반복해 모든 시도가 mid-pagination 에서 실패하도록 구성.
+    """
+    # 매 시도가 page=1 받고 post-page 체크에서 다른 SHA 발견 → ABA 발생.
+    # 시도 1: pulls=A (initial), files1, files2, pulls=B (post-page) → mismatch → raise
+    # 시도 2: pulls=B (initial), files1, files2, pulls=C (post-page) → mismatch → raise
+    # 시도 3: pulls=C (initial), files1, files2, pulls=D (post-page) → mismatch → exhausted
+    fake, _counters = _build_fake_urlopen_paginated_aba(
+        sha_sequence=["A", "B", "B", "C", "C", "D", "D", "E"]
+    )
+    monkeypatch.setattr(urllib.request, "urlopen", fake)
+    monkeypatch.setattr(jwt, "encode", lambda *a, **k: "fake.jwt")
+
+    client = GitHubAppClient(app_id=1, private_key_pem="-")
+    with pytest.raises(RuntimeError, match="head_sha kept changing") as exc_info:
+        client.fetch_pull_request(RepoRef("o", "r"), 9, installation_id=7)
+
+    # 메시지에 mid-pagination 모드 명시
+    assert "mid-pagination" in str(exc_info.value), (
+        "ABA exhaustion 케이스에선 메시지에 'mid-pagination' 이 들어가야 운영자가 "
+        "fetch 시작-끝 모드와 구분 가능"
+    )
+    # cause chain — 마지막 ABA 예외가 traceback 에 노출돼야 진단 정확도가 올라감
+    cause = exc_info.value.__cause__
+    assert cause is not None
+    assert "mid-pagination" in str(cause)
+
+
+def test_fetch_pull_request_reports_start_end_mode_when_last_failure_is_start_end(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """마지막 시도가 start/end 모드로 끝났는데 이전 시도의 mid-pagination 예외가 남아
+    잘못 보고되는 회귀 방지 (codex PR #19 review #6).
+
+    `last_mid_pagination_exc` 변수가 시도 간에 리셋되지 않으면, 시도 1 이 mid-pagination
+    으로 실패한 뒤 시도 3 이 start/end mismatch 로 실패해도 옛 mid-pagination 예외가
+    남아 있어 exhaustion 메시지가 잘못된 모드를 가리킨다. 시도 시작 시 None 으로 초기화
+    해야 한다.
+
+    시나리오 (단일 페이지 PR, post-page + final recheck 둘 다 post-page check 함수):
+      - 시도 1: pulls=A (initial), post-page=B (shas[1]) → mid-pagination raise
+        → last_mid_pagination_exc 에 시도 1 예외 기록, pr_data=None
+      - 시도 2: pulls=B (initial 새로), post-page=B (match), recheck=C (mismatch)
+        → start/end raise. 만약 리셋 안 되면 옛 시도 1 예외가 여전히 남음.
+      - 시도 3: pulls=C (carried), post-page=C (match), recheck=D (mismatch)
+        → start/end raise, exhausted. 마지막 모드는 start/end.
+    """
+    fake, _counters = _build_fake_urlopen_for_fetch_pr(
+        head_shas=["A", "B", "B", "B", "C", "C", "D"]
+    )
+    monkeypatch.setattr(urllib.request, "urlopen", fake)
+    monkeypatch.setattr(jwt, "encode", lambda *a, **k: "fake.jwt")
+
+    client = GitHubAppClient(app_id=1, private_key_pem="-")
+    with pytest.raises(RuntimeError, match="head_sha kept changing") as exc_info:
+        client.fetch_pull_request(RepoRef("o", "r"), 9, installation_id=7)
+
+    # 마지막 시도는 start/end mode 로 실패 — 메시지가 그 모드여야
+    msg = str(exc_info.value)
+    assert "fetch start/end SHA mismatch" in msg, (
+        f"마지막 실패 모드는 start/end 인데 '{msg}' 는 잘못된 모드로 보고함 — "
+        "시도 간 last_mid_pagination_exc 가 리셋되지 않아 옛 예외가 남은 회귀"
+    )
+    assert "mid-pagination" not in msg, (
+        "이전 시도의 mid-pagination 예외가 마지막 모드 진단에 누수되면 안 된다"
+    )
+    # cause chain 도 없어야 — 마지막 실패가 start/end 라 mid-pagination 예외를 chain 할 이유 없음
+    assert exc_info.value.__cause__ is None
+
+
+def _build_fake_urlopen_paginated_aba(
+    sha_sequence: list[str],
+    *,
+    counters: dict[str, int] | None = None,
+):
+    """멀티페이지 /files + /pulls SHA 시퀀스를 시뮬하는 urlopen.
+
+    - /files?page=1 → 100개 항목 반환 (페이지 강제)
+    - /files?page=2 → 50개 항목 반환 (마지막 페이지)
+    - /files?page=3+ → 빈 배열
+    - /pulls/{n} → `sha_sequence` 순서대로 head_sha 반환 (마지막 값은 계속 사용)
+    """
+    if counters is None:
+        counters = {"pulls": 0, "files1": 0, "files2": 0}
+
+    def fake_urlopen(
+        req: urllib.request.Request,
+        *,
+        timeout: float | None = None,
+        context: ssl.SSLContext | None = None,
+    ) -> _FakeResponse:
+        if "access_tokens" in req.full_url:
+            return _FakeResponse(b'{"token": "tkn", "expires_at": ""}')
+        if "/files" in req.full_url:
+            # `&page=N` 로 매칭 — `per_page=100` 안의 "page=1" 오탐 회피 (URL 에
+            # `per_page=100&page=2` 가 들어가면 `"page=1"` substring 검색이
+            # 히트해서 무한 루프가 나던 bug 가 있었음).
+            if "&page=1" in req.full_url:
+                counters["files1"] += 1
+                # 100개 — GitHub 페이지 크기 꽉 채워서 다음 페이지 있음을 signaling
+                items = [
+                    {"filename": f"p1_{i}.py", "patch": "@@ -1 +1 @@\n+x\n"}
+                    for i in range(100)
+                ]
+                return _FakeResponse(json.dumps(items).encode())
+            if "&page=2" in req.full_url:
+                counters["files2"] += 1
+                items = [
+                    {"filename": f"p2_{i}.py", "patch": "@@ -1 +1 @@\n+y\n"}
+                    for i in range(50)
+                ]
+                return _FakeResponse(json.dumps(items).encode())
+            return _FakeResponse(b'[]')
+        # /pulls/{n}
+        idx = min(counters["pulls"], len(sha_sequence) - 1)
+        sha = sha_sequence[idx]
+        counters["pulls"] += 1
+        return _FakeResponse(json.dumps({
+            "title": "t",
+            "body": "b",
+            "draft": False,
+            "head": {"sha": sha, "ref": "feat", "repo": {"clone_url": "https://x.git"}},
+            "base": {"sha": "base-sha", "ref": "main"},
+        }).encode())
+
+    return fake_urlopen, counters
+
+
+def test_fetch_pull_request_detects_aba_race_mid_pagination(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """ABA race: /files 페이지1 과 페이지2 사이 head 가 A→B 로 변했다가 최종 recheck 시
+    다시 A 로 돌아온 경우. 시작/끝 SHA 비교만으로는 못 잡는 경계 조건을 잠금.
+
+    회귀 방지 (codex PR #19 review #3): 페이지 1 은 SHA A 기준 patch, 페이지 2 는 SHA B
+    기준 patch 로 섞여서 들어왔는데, PullRequest 엔 A 의 head_sha + 혼합 addable_lines
+    가 박혀 인라인 코멘트 위치가 어긋난다. 페이지 사이 /pulls 체크로 즉시 감지 후 전체
+    fetch 를 재시도해야 한다.
+
+    시나리오 (시도 1):
+      - /pulls (initial) → A
+      - /files page=1 (100개, A 기준)
+      - /pulls (between-pages) → B   ← 여기서 감지 → _HeadShaChangedMidFetch 발생
+    시나리오 (시도 2, 재시작):
+      - /pulls (initial) → B (안정)
+      - /files page=1 (100개, B 기준)
+      - /pulls (between-pages) → B (변동 없음)
+      - /files page=2 (50개, B 기준)
+      - /pulls (final recheck) → B (일관) → 정상 반환
+    """
+    # ABA: initial A, mid-pagination A→B, 그 뒤로는 계속 B
+    # 그러면 between-pages 체크에서 B 를 발견하고 재시도 → 2차는 모두 B 로 성공
+    fake, counters = _build_fake_urlopen_paginated_aba(
+        sha_sequence=["A", "B", "B", "B", "B", "B"]
+    )
+    monkeypatch.setattr(urllib.request, "urlopen", fake)
+    monkeypatch.setattr(jwt, "encode", lambda *a, **k: "fake.jwt")
+
+    client = GitHubAppClient(app_id=1, private_key_pem="-")
+    with caplog.at_level(logging.WARNING):
+        pr = client.fetch_pull_request(RepoRef("o", "r"), 9, installation_id=7)
+
+    # 2차 시도에서 모두 B 였으므로 최종 head_sha 는 B
+    assert pr.head_sha == "B"
+    # mid-pagination 에서 race 감지됐다는 WARN 관측
+    mid_warns = [
+        r for r in caplog.records if "mid-pagination" in r.getMessage()
+    ]
+    assert len(mid_warns) == 1, "페이지 사이 SHA 변동이 감지돼 WARN 한 줄 남아야 한다"
+    assert "A" in mid_warns[0].getMessage() and "B" in mid_warns[0].getMessage()
+    # changed_files 는 2차 시도의 150개 (100 + 50)
+    assert len(pr.changed_files) == 150
+
+
+def test_fetch_pull_request_detects_single_page_aba(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """단일 페이지 PR 의 ABA race: `initial=A → /files=B → recheck=A` 를 post-page check 로 잡는다.
+
+    회귀 방지 (codex PR #19 review #7): 이전엔 `page > 1` 에서만 post-page check 를
+    수행해 단일 페이지 PR 의 ABA race (바깥 start/end 비교만으로는 못 잡음) 를 놓쳤다.
+    첫 페이지도 검증 대상이라는 정책의 정합성.
+
+    시나리오: initial=A, page=1 받음 (A 기준이든 B 기준이든 상관없음), post-page check
+    에서 SHA=B 발견 → mid-pagination raise. 재시도 후 2차에서는 SHA 가 안정돼 정상 반환.
+    """
+    # 시도 1: init=A, post-page=B → mid-pagination raise
+    # 시도 2: init=A (새로, pr_data=None 이었음), post-page=A, recheck=A → return
+    fake, counters = _build_fake_urlopen_for_fetch_pr(
+        head_shas=["A", "B", "A", "A", "A"]
+    )
+    monkeypatch.setattr(urllib.request, "urlopen", fake)
+    monkeypatch.setattr(jwt, "encode", lambda *a, **k: "fake.jwt")
+
+    client = GitHubAppClient(app_id=1, private_key_pem="-")
+    pr = client.fetch_pull_request(RepoRef("o", "r"), 9, installation_id=7)
+
+    assert pr.head_sha == "A", "재시도 후 안정된 A 로 반환"
+    # ABA 가 post-page 에서 감지됐는지 확인: /pulls 5회 (1차 2회 + 2차 initial+post-page+recheck=3회)
+    assert counters["pulls"] == 5
+    assert counters["files"] == 2
+
+
+def test_fetch_pull_request_skips_check_on_empty_final_page(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """정확히 100 배수 파일을 가진 PR 에서 빈 마지막 페이지는 post-page check 를 스킵.
+
+    회귀 방지 (codex PR #19 review #8): `if not files: break` 를 SHA check 보다 먼저
+    두면 누적할 게 없는 빈 페이지에 대해 불필요한 /pulls 호출이 발생하지 않는다. 이
+    최적화가 깨지면 정확히 100 배수 파일 PR 의 API 비용이 늘고, 빈 페이지에서 head_sha
+    가 움직였다 하더라도 누적된 데이터는 이전 페이지 기준이라 사실상 오탐.
+
+    시나리오: page=1 에서 100개 반환 → page=2 에서 빈 배열. page=2 응답 직후에 empty
+    check 가 먼저 발동해 loop 이 break, post-page check 는 일어나지 않아야.
+    """
+    counters: dict[str, int] = {"pulls": 0, "files": 0}
+
+    def fake_urlopen(
+        req: urllib.request.Request,
+        *,
+        timeout: float | None = None,
+        context: ssl.SSLContext | None = None,
+    ) -> _FakeResponse:
+        if "access_tokens" in req.full_url:
+            return _FakeResponse(b'{"token": "tkn", "expires_at": ""}')
+        if "/files" in req.full_url:
+            counters["files"] += 1
+            if "&page=1" in req.full_url:
+                items = [{"filename": f"p_{i}.py", "patch": "@@ -1 +1 @@\n+x\n"} for i in range(100)]
+                return _FakeResponse(json.dumps(items).encode())
+            return _FakeResponse(b'[]')  # page=2 는 빈 배열
+        counters["pulls"] += 1
+        return _FakeResponse(json.dumps({
+            "title": "t", "body": "b", "draft": False,
+            "head": {"sha": "A", "ref": "feat", "repo": {"clone_url": "https://x.git"}},
+            "base": {"sha": "base", "ref": "main"},
+        }).encode())
+
+    monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+    monkeypatch.setattr(jwt, "encode", lambda *a, **k: "fake.jwt")
+
+    client = GitHubAppClient(app_id=1, private_key_pem="-")
+    pr = client.fetch_pull_request(RepoRef("o", "r"), 9, installation_id=7)
+
+    assert pr.head_sha == "A"
+    assert len(pr.changed_files) == 100
+    # /pulls 호출 = initial + post-page-1 + (no check on empty page=2) + final recheck = 3
+    # 만약 empty check 가 없었다면 4 회 (page=2 의 post-page check 포함).
+    assert counters["pulls"] == 3, (
+        "빈 페이지에서는 post-page check 를 스킵해야 정확히 100 배수 파일 PR 의 비용 낭비 방지"
+    )
+    assert counters["files"] == 2  # page=1 + page=2 (empty)
+
+
+# --- 삭제된 fork PR fallback (merged from PR #21) ----------------------------
+
+
 def _make_fake_urlopen_for_pr_meta(head_repo: Any) -> Any:
-    """_resolve_clone_url 테스트용 urlopen — head.repo 값을 자유롭게 제어.
+    """_resolve_fetch_source 테스트용 urlopen — head.repo 값을 자유롭게 제어.
 
     `head_repo` 를 `None` 또는 빈 dict 또는 정상 dict 로 넘겨서 fork 시나리오를 시뮬.
     """

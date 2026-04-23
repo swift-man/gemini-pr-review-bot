@@ -25,6 +25,33 @@ def _default_tls_context() -> ssl.SSLContext:
     return ssl.create_default_context(cafile=certifi.where())
 
 
+# fetch_pull_request 의 head_sha 일관성 재시도 한도. /pulls/{n} → /files 사이 push race
+# 가 발생했을 때 재시도. 2회까지 — 그 이상은 force push 폭주 시나리오로 보고 명시적
+# 실패시켜 운영자가 알아차리게 한다 (조용한 무한 retry 가 더 위험).
+_MAX_FETCH_ATTEMPTS = 3
+
+
+class _HeadShaChangedMidFetch(Exception):
+    """`/files` 페이지네이션 도중 head_sha 가 움직였다는 내부 signal.
+
+    기존 "fetch 전/후 `initial_sha == rechecked_sha` 비교" 만으로는 ABA race 를 잡지
+    못한다 — 페이지 1 은 SHA A 기준, 페이지 2 는 SHA B 기준으로 받았지만 마지막
+    recheck 시점에 다시 A 로 돌아와 있는 force-push 흐름. 이 경우 changed_files 와
+    addable_lines 가 서로 다른 페이지의 혼합 스냅샷이 돼 라인 분할이 어긋난다.
+
+    `_fetch_files_for_pr` 가 페이지 사이에 `/pulls/{n}` 을 찍어 head_sha 가 바뀐 걸
+    감지하면 이 예외를 올려 바깥 재시도 루프가 전체 fetch 를 다시 시도하도록 한다.
+    (codex PR #19 review #3 대응)
+    """
+
+    def __init__(self, initial_sha: str, current_sha: str) -> None:
+        super().__init__(
+            f"head_sha changed mid-pagination: {initial_sha} -> {current_sha}"
+        )
+        self.initial_sha = initial_sha
+        self.current_sha = current_sha
+
+
 @dataclass(frozen=True)
 class _CachedToken:
     token: str
@@ -89,23 +116,186 @@ class GitHubAppClient:
     ) -> PullRequest:
         token = self.get_installation_token(installation_id)
         pr_url = f"{self._api_base}/repos/{repo.full_name}/pulls/{number}"
-        pr_data = self._request_object("GET", pr_url, auth=f"token {token}")
 
-        # /files 한 번 호출로 두 가지를 동시 수집:
-        #   1) changed_files 목록 (file_collector 우선순위 정렬용)
-        #   2) 각 파일의 patch → addable_lines 사전 파싱 (post_review 인라인 분할용)
-        # post_review 시점에 같은 호출을 다시 하면 그 사이 사용자가 push 한 새 커밋의
-        # patch 를 받게 돼 모델 finding 의 라인 번호와 불일치하는 race condition 이
-        # 발생함. head_sha 시점에 한 번만 fetch 해 PullRequest 에 캐싱하는 것이 핵심.
-        # per_page=100 은 GitHub 허용 최대치라 PR 이 큰 경우의 라운드트립 수를 최소화.
+        # ---- head_sha 일관성 재시도 루프 -----------------------------------
+        # PR #15 가 "post_review 가 /files 를 다시 부르는" 큰 race 를 닫았지만, 더 작은
+        # race 가 fetch_pull_request 안쪽에 남아 있다: GET /pulls/{n} 으로 head_sha 를
+        # 받고 GET /files 로 patch 를 받는 그 사이에도 사용자가 push 할 수 있다.
+        # 이 경우 PullRequest 에 박힌 head_sha 는 "옛 SHA" 인데 addable_lines/
+        # changed_files 는 "새 SHA" 의 것이라 라인 분할이 어긋난다.
+        # 해결: /files 끝낸 뒤 /pulls/{n} 을 다시 한 번 짚어 head_sha 가 그대로인지 확인.
+        # 변했다면 한 번 더 같은 SHA 로 다시 받도록 재시도. 무한 루프 회피를 위해
+        # _MAX_FETCH_ATTEMPTS 로 제한 — force-push 폭주는 운영자가 알아채야 한다.
+        #
+        # 호출 절감: 재시도 시 직전 iteration 의 `recheck` 결과를 다음 `pr_data` 로 그대로
+        # 재사용한다. 이렇게 하면 N 회 시도 시 `/pulls` 호출이 2N 회가 아니라 N+1 회로
+        # 줄어든다 (gemini PR #19 review #1).
+        pr_data: dict[str, Any] | None = None
+        # **마지막 시도** 의 실패 모드를 RuntimeError 메시지/cause 에 반영해 운영자가
+        # "ABA 페이지 race" vs "fetch 시작-끝 SHA 변경" 을 구분할 수 있게 한다
+        # (codex PR #19 review #4). 두 실패 모드는 디버깅 액션이 다름.
+        #
+        # 시도마다 reset 해야 — 이전 시도가 mid-pagination 으로 끝나고 마지막 시도가
+        # start/end 로 끝났는데도 옛 mid-pagination 예외가 남아 잘못된 모드로 보고되는
+        # 회귀를 막는다 (codex PR #19 review #6). 매 iteration 시작에서 None 으로 초기화.
+        last_mid_pagination_exc: _HeadShaChangedMidFetch | None = None
+        for attempt in range(1, _MAX_FETCH_ATTEMPTS + 1):
+            last_mid_pagination_exc = None  # 시도 시작마다 초기화 — 이전 시도의 모드가 새 시도에 안 새도록
+            if pr_data is None:
+                pr_data = self._request_object("GET", pr_url, auth=f"token {token}")
+            initial_sha = str(pr_data["head"]["sha"])
+
+            try:
+                changed, addable = self._fetch_files_for_pr(
+                    pr_url, token, initial_sha=initial_sha
+                )
+            except _HeadShaChangedMidFetch as exc:
+                # 페이지네이션 도중 head_sha 가 움직였음 — 전체 fetch 재시도.
+                # 바깥 initial/rechecked 비교와 별도 (그건 fetch 시작-끝만 커버).
+                last_mid_pagination_exc = exc
+                if attempt < _MAX_FETCH_ATTEMPTS:
+                    logger.warning(
+                        "PR %s#%d head_sha changed mid-pagination (%s -> %s); "
+                        "restarting fetch (attempt %d/%d)",
+                        repo.full_name,
+                        number,
+                        exc.initial_sha,
+                        exc.current_sha,
+                        attempt + 1,
+                        _MAX_FETCH_ATTEMPTS,
+                    )
+                # 다음 iteration 은 새 /pulls 호출로 초기화 (이전 pr_data 는 이미 stale).
+                pr_data = None
+                continue
+
+            # /files 직후 head_sha 재확인. 같으면 그 SHA 의 일관된 스냅샷으로 확정.
+            recheck = self._request_object("GET", pr_url, auth=f"token {token}")
+            rechecked_sha = str(recheck["head"]["sha"])
+            if rechecked_sha == initial_sha:
+                # head_sha 가 동일함이 보장됐으므로 changed/addable 는 어느 응답 기준이든
+                # 일관됨. 메타데이터(title/body/draft) 는 더 신선한 `recheck` 기준으로
+                # 채택해 fetch 도중 변동된 사소한 메타도 누락 없이 반영 (gemini PR #19
+                # review #2). head_sha 는 동일하므로 안전.
+                head = recheck["head"]
+                base = recheck["base"]
+                head_sha = str(head["sha"])
+                # `_resolve_fetch_source` (PR #21) 는 fork 가 삭제된 PR 도 base.repo +
+                # `refs/pull/{n}/head` 로 fetch 가능하도록 (clone_url, fetch_ref) 쌍을 함께
+                # 결정한다. 두 값을 동시 결정해야 downstream `GitRepoFetcher` 가 일관된
+                # 경로로 PR 스냅샷을 받음.
+                clone_url, fetch_ref = _resolve_fetch_source(
+                    repo, number, head_sha, head, base
+                )
+                # GitHub 응답에서 title/body 는 종종 명시적 `null` 로 온다 (예: 본문이
+                # 비어 있는 PR). `dict.get(key, default)` 는 키가 있고 값이 None 이면 None
+                # 을 그대로 반환하므로 `default` 가 적용되지 않는다. `str(None)` 이 들어가
+                # `"None"` 문자열로 오염되는 회귀를 막기 위해 `or ""` 패턴으로 일관 처리
+                # (gemini PR #19 review #2 — body 와 동일한 패턴 채택).
+                return PullRequest(
+                    repo=repo,
+                    number=number,
+                    title=str(recheck.get("title") or ""),
+                    body=str(recheck.get("body") or ""),
+                    head_sha=head_sha,
+                    head_ref=str(head["ref"]),
+                    base_sha=str(base["sha"]),
+                    base_ref=str(base["ref"]),
+                    clone_url=clone_url,
+                    fetch_ref=fetch_ref,
+                    changed_files=tuple(changed),
+                    installation_id=installation_id,
+                    is_draft=bool(recheck.get("draft", False)),
+                    addable_lines=tuple(addable),
+                )
+
+            # 다음 iteration 은 이 recheck 결과를 시작점으로 — 여분의 /pulls 호출 회피.
+            pr_data = recheck
+
+            # 마지막 시도라면 곧바로 RuntimeError 로 빠진다 — "retrying" 표기는 거짓.
+            # 실제 재시도가 일어날 때만 로깅 (gemini PR #19 review #2).
+            if attempt < _MAX_FETCH_ATTEMPTS:
+                logger.warning(
+                    "PR %s#%d head_sha changed during fetch (%s -> %s); "
+                    "retrying attempt %d/%d to get a consistent snapshot",
+                    repo.full_name,
+                    number,
+                    initial_sha,
+                    rechecked_sha,
+                    attempt + 1,
+                    _MAX_FETCH_ATTEMPTS,
+                )
+
+        # 여기에 도달했다는 건 매 시도마다 head_sha 가 바뀌었다는 뜻 — 사용자가
+        # 지속적으로 force push 하고 있는 상태. 조용히 잘못된 데이터로 진행하기보다
+        # 명시적으로 실패시켜 webhook 큐 자체에서 빼는 게 안전하다 (다음 push 의 새
+        # webhook 이 새 시작점이 됨).
+        # 실패 모드를 메시지로 구분 (codex PR #19 review #4): 마지막 시도가 페이지네이션
+        # 중 ABA race 였다면 그 예외를 cause 로 chain 해 traceback 에 원인 노출. 그렇지
+        # 않으면 fetch 시작-끝 SHA 비교에서 실패한 케이스. 두 모드의 디버깅 액션이
+        # 다르므로 같은 메시지로 묶이면 운영자 진단을 잘못된 방향으로 유도한다.
+        if last_mid_pagination_exc is not None:
+            raise RuntimeError(
+                f"PR {repo.full_name}#{number} head_sha kept changing across "
+                f"{_MAX_FETCH_ATTEMPTS} attempts (last failure: mid-pagination ABA "
+                "during /files). Skipping; the next push webhook will retry."
+            ) from last_mid_pagination_exc
+        raise RuntimeError(
+            f"PR {repo.full_name}#{number} head_sha kept changing across "
+            f"{_MAX_FETCH_ATTEMPTS} attempts (last failure: fetch start/end SHA "
+            "mismatch — push between /pulls and /files). Skipping; the next push "
+            "webhook will retry."
+        )
+
+    def _fetch_files_for_pr(
+        self, pr_url: str, token: str, *, initial_sha: str
+    ) -> tuple[list[str], list[tuple[str, frozenset[int]]]]:
+        """`/pulls/{n}/files` 를 페이지네이션 끝까지 돌며 (changed, addable) 한 쌍을 만든다.
+
+        한 호출로 두 가지를 동시 수집:
+          1) changed_files 목록 (file_collector 우선순위 정렬용)
+          2) 각 파일의 patch → addable_lines 사전 파싱 (post_review 인라인 분할용)
+        per_page=100 은 GitHub 허용 최대치라 PR 이 큰 경우의 라운드트립 수를 최소화.
+
+        ### ABA race 방어 (codex PR #19 review #3 → #5 보강)
+
+        멀티 페이지 PR 에서 페이지 1 은 SHA A 기준, 페이지 2 는 SHA B 기준 patch 로
+        받았더라도 마지막 recheck 시점이 다시 A 라면 바깥 비교는 통과하고 서로 다른
+        페이지가 혼합된 스냅샷이 PullRequest 에 박힌다.
+
+        검증 위치는 **각 페이지 응답 직후, 누적 전** (페이지 2+) 으로 잡는다 — 누적된
+        데이터가 항상 `initial_sha` 기준임을 보장. 이전 구현은 "다음 페이지 요청 직전"
+        에만 검증했는데, 그러면 검증 직후 push 가 발생해 다음 페이지를 다른 SHA 기준으로
+        받아오는 창이 남았다 (codex PR #19 review #5).
+
+        **첫 페이지도 검증** (codex PR #19 review #7): 페이지 1 은 `initial_sha` 직후라
+        race window 가 좁긴 하지만, 단일 페이지 PR 에서 `initial=A → /files=B → recheck=A`
+        형태의 ABA 는 외부 비교만으로는 잡히지 않는다. 비용은 PR 당 `/pulls` 1회 추가.
+
+        **빈 페이지 최적화** (codex PR #19 review #8): `if not files: break` 를 SHA 검증
+        보다 먼저 실행해 정확히 100 배수 파일을 가진 PR 이 빈 마지막 페이지에 대해 불필요한
+        검증 호출을 하지 않도록 한다. 빈 페이지는 누적될 게 없으니 검증 의미 없음.
+
+        호출 비용 비교:
+          - 1 페이지 PR: initial(1) + page1(1) + post-page check(1) + final recheck(1) = 4
+          - N 페이지 PR (N>=2): initial(1) + N pages + N post-page checks + final(1) = 2N+2
+          - 정확히 100 배수 파일 PR: 빈 페이지는 break 먼저 → check 스킵
+        """
         files_url = f"{pr_url}/files?per_page=100"
         changed: list[str] = []
         addable: list[tuple[str, frozenset[int]]] = []
         page = 1
         while True:
             files = self._request_list("GET", f"{files_url}&page={page}", auth=f"token {token}")
+            # 빈 페이지 → 누적도 검증도 의미 없음. early-exit.
             if not files:
                 break
+            # 페이지 응답 직후, 누적 전에 head_sha 검증. 단일 페이지 ABA 까지 커버하려면
+            # 첫 페이지도 검증 필요 (codex PR #19 review #7). race window 를 페이지 응답
+            # ~ 검증 사이 마이크로초 단위로 축소.
+            check = self._request_object("GET", pr_url, auth=f"token {token}")
+            current_sha = str(check["head"]["sha"])
+            if current_sha != initial_sha:
+                raise _HeadShaChangedMidFetch(initial_sha, current_sha)
             for file_entry in files:
                 filename = str(file_entry["filename"])
                 changed.append(filename)
@@ -123,27 +313,7 @@ class GitHubAppClient:
             if len(files) < 100:
                 break
             page += 1
-
-        head = pr_data["head"]
-        base = pr_data["base"]
-        head_sha = str(head["sha"])
-        clone_url, fetch_ref = _resolve_fetch_source(repo, number, head_sha, head, base)
-        return PullRequest(
-            repo=repo,
-            number=number,
-            title=str(pr_data.get("title", "")),
-            body=str(pr_data.get("body") or ""),
-            head_sha=head_sha,
-            head_ref=str(head["ref"]),
-            base_sha=str(base["sha"]),
-            base_ref=str(base["ref"]),
-            clone_url=clone_url,
-            fetch_ref=fetch_ref,
-            changed_files=tuple(changed),
-            installation_id=installation_id,
-            is_draft=bool(pr_data.get("draft", False)),
-            addable_lines=tuple(addable),
-        )
+        return changed, addable
 
     def post_review(self, pr: PullRequest, result: ReviewResult) -> None:
         if self._dry_run:
