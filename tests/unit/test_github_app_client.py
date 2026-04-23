@@ -771,6 +771,136 @@ def test_fetch_pull_request_raises_when_head_sha_keeps_changing(
     )
 
 
+def _build_fake_urlopen_paginated_aba(
+    sha_sequence: list[str],
+    *,
+    counters: dict[str, int] | None = None,
+):
+    """멀티페이지 /files + /pulls SHA 시퀀스를 시뮬하는 urlopen.
+
+    - /files?page=1 → 100개 항목 반환 (페이지 강제)
+    - /files?page=2 → 50개 항목 반환 (마지막 페이지)
+    - /files?page=3+ → 빈 배열
+    - /pulls/{n} → `sha_sequence` 순서대로 head_sha 반환 (마지막 값은 계속 사용)
+    """
+    if counters is None:
+        counters = {"pulls": 0, "files1": 0, "files2": 0}
+
+    def fake_urlopen(
+        req: urllib.request.Request,
+        *,
+        timeout: float | None = None,
+        context: ssl.SSLContext | None = None,
+    ) -> _FakeResponse:
+        if "access_tokens" in req.full_url:
+            return _FakeResponse(b'{"token": "tkn", "expires_at": ""}')
+        if "/files" in req.full_url:
+            # `&page=N` 로 매칭 — `per_page=100` 안의 "page=1" 오탐 회피 (URL 에
+            # `per_page=100&page=2` 가 들어가면 `"page=1"` substring 검색이
+            # 히트해서 무한 루프가 나던 bug 가 있었음).
+            if "&page=1" in req.full_url:
+                counters["files1"] += 1
+                # 100개 — GitHub 페이지 크기 꽉 채워서 다음 페이지 있음을 signaling
+                items = [
+                    {"filename": f"p1_{i}.py", "patch": "@@ -1 +1 @@\n+x\n"}
+                    for i in range(100)
+                ]
+                return _FakeResponse(json.dumps(items).encode())
+            if "&page=2" in req.full_url:
+                counters["files2"] += 1
+                items = [
+                    {"filename": f"p2_{i}.py", "patch": "@@ -1 +1 @@\n+y\n"}
+                    for i in range(50)
+                ]
+                return _FakeResponse(json.dumps(items).encode())
+            return _FakeResponse(b'[]')
+        # /pulls/{n}
+        idx = min(counters["pulls"], len(sha_sequence) - 1)
+        sha = sha_sequence[idx]
+        counters["pulls"] += 1
+        return _FakeResponse(json.dumps({
+            "title": "t",
+            "body": "b",
+            "draft": False,
+            "head": {"sha": sha, "ref": "feat", "repo": {"clone_url": "https://x.git"}},
+            "base": {"sha": "base-sha", "ref": "main"},
+        }).encode())
+
+    return fake_urlopen, counters
+
+
+def test_fetch_pull_request_detects_aba_race_mid_pagination(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """ABA race: /files 페이지1 과 페이지2 사이 head 가 A→B 로 변했다가 최종 recheck 시
+    다시 A 로 돌아온 경우. 시작/끝 SHA 비교만으로는 못 잡는 경계 조건을 잠금.
+
+    회귀 방지 (codex PR #19 review #3): 페이지 1 은 SHA A 기준 patch, 페이지 2 는 SHA B
+    기준 patch 로 섞여서 들어왔는데, PullRequest 엔 A 의 head_sha + 혼합 addable_lines
+    가 박혀 인라인 코멘트 위치가 어긋난다. 페이지 사이 /pulls 체크로 즉시 감지 후 전체
+    fetch 를 재시도해야 한다.
+
+    시나리오 (시도 1):
+      - /pulls (initial) → A
+      - /files page=1 (100개, A 기준)
+      - /pulls (between-pages) → B   ← 여기서 감지 → _HeadShaChangedMidFetch 발생
+    시나리오 (시도 2, 재시작):
+      - /pulls (initial) → B (안정)
+      - /files page=1 (100개, B 기준)
+      - /pulls (between-pages) → B (변동 없음)
+      - /files page=2 (50개, B 기준)
+      - /pulls (final recheck) → B (일관) → 정상 반환
+    """
+    # ABA: initial A, mid-pagination A→B, 그 뒤로는 계속 B
+    # 그러면 between-pages 체크에서 B 를 발견하고 재시도 → 2차는 모두 B 로 성공
+    fake, counters = _build_fake_urlopen_paginated_aba(
+        sha_sequence=["A", "B", "B", "B", "B", "B"]
+    )
+    monkeypatch.setattr(urllib.request, "urlopen", fake)
+    monkeypatch.setattr(jwt, "encode", lambda *a, **k: "fake.jwt")
+
+    client = GitHubAppClient(app_id=1, private_key_pem="-")
+    with caplog.at_level(logging.WARNING):
+        pr = client.fetch_pull_request(RepoRef("o", "r"), 9, installation_id=7)
+
+    # 2차 시도에서 모두 B 였으므로 최종 head_sha 는 B
+    assert pr.head_sha == "B"
+    # mid-pagination 에서 race 감지됐다는 WARN 관측
+    mid_warns = [
+        r for r in caplog.records if "mid-pagination" in r.getMessage()
+    ]
+    assert len(mid_warns) == 1, "페이지 사이 SHA 변동이 감지돼 WARN 한 줄 남아야 한다"
+    assert "A" in mid_warns[0].getMessage() and "B" in mid_warns[0].getMessage()
+    # changed_files 는 2차 시도의 150개 (100 + 50)
+    assert len(pr.changed_files) == 150
+
+
+def test_fetch_pull_request_single_page_skips_between_page_checks(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """단일 페이지 PR 에선 between-page 체크가 발동하지 않아 호출 비용 그대로.
+
+    회귀 방지: ABA 방어 코드가 단일 페이지 PR (실제 거의 대부분) 에서도 매번 추가 /pulls
+    호출을 유발하면 불필요한 API 비용 증가. `len(files) < 100` 조기 종료 경로에서는
+    between-page 체크가 실행되지 않아야 한다.
+
+    /pulls 호출 2회 (initial + final recheck) 만 발생해야 한다.
+    """
+    fake, counters = _build_fake_urlopen_for_fetch_pr(head_shas=["abc"])
+    monkeypatch.setattr(urllib.request, "urlopen", fake)
+    monkeypatch.setattr(jwt, "encode", lambda *a, **k: "fake.jwt")
+
+    client = GitHubAppClient(app_id=1, private_key_pem="-")
+    pr = client.fetch_pull_request(RepoRef("o", "r"), 9, installation_id=7)
+
+    assert pr.head_sha == "abc"
+    # between-page 체크가 추가 호출을 만들었다면 3 이상. 정확히 2여야 한다.
+    assert counters["pulls"] == 2, (
+        "단일 페이지 PR 에선 between-page /pulls 체크가 발동하면 안 된다"
+    )
+
+
 def test_http_attaches_response_detail_to_httperror(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

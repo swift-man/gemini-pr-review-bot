@@ -31,6 +31,27 @@ def _default_tls_context() -> ssl.SSLContext:
 _MAX_FETCH_ATTEMPTS = 3
 
 
+class _HeadShaChangedMidFetch(Exception):
+    """`/files` 페이지네이션 도중 head_sha 가 움직였다는 내부 signal.
+
+    기존 "fetch 전/후 `initial_sha == rechecked_sha` 비교" 만으로는 ABA race 를 잡지
+    못한다 — 페이지 1 은 SHA A 기준, 페이지 2 는 SHA B 기준으로 받았지만 마지막
+    recheck 시점에 다시 A 로 돌아와 있는 force-push 흐름. 이 경우 changed_files 와
+    addable_lines 가 서로 다른 페이지의 혼합 스냅샷이 돼 라인 분할이 어긋난다.
+
+    `_fetch_files_for_pr` 가 페이지 사이에 `/pulls/{n}` 을 찍어 head_sha 가 바뀐 걸
+    감지하면 이 예외를 올려 바깥 재시도 루프가 전체 fetch 를 다시 시도하도록 한다.
+    (codex PR #19 review #3 대응)
+    """
+
+    def __init__(self, initial_sha: str, current_sha: str) -> None:
+        super().__init__(
+            f"head_sha changed mid-pagination: {initial_sha} -> {current_sha}"
+        )
+        self.initial_sha = initial_sha
+        self.current_sha = current_sha
+
+
 @dataclass(frozen=True)
 class _CachedToken:
     token: str
@@ -114,7 +135,28 @@ class GitHubAppClient:
             if pr_data is None:
                 pr_data = self._request_object("GET", pr_url, auth=f"token {token}")
             initial_sha = str(pr_data["head"]["sha"])
-            changed, addable = self._fetch_files_for_pr(pr_url, token)
+
+            try:
+                changed, addable = self._fetch_files_for_pr(
+                    pr_url, token, initial_sha=initial_sha
+                )
+            except _HeadShaChangedMidFetch as exc:
+                # 페이지네이션 도중 head_sha 가 움직였음 — 전체 fetch 재시도.
+                # 바깥 initial/rechecked 비교와 별도 (그건 fetch 시작-끝만 커버).
+                if attempt < _MAX_FETCH_ATTEMPTS:
+                    logger.warning(
+                        "PR %s#%d head_sha changed mid-pagination (%s -> %s); "
+                        "restarting fetch (attempt %d/%d)",
+                        repo.full_name,
+                        number,
+                        exc.initial_sha,
+                        exc.current_sha,
+                        attempt + 1,
+                        _MAX_FETCH_ATTEMPTS,
+                    )
+                # 다음 iteration 은 새 /pulls 호출로 초기화 (이전 pr_data 는 이미 stale).
+                pr_data = None
+                continue
 
             # /files 직후 head_sha 재확인. 같으면 그 SHA 의 일관된 스냅샷으로 확정.
             recheck = self._request_object("GET", pr_url, auth=f"token {token}")
@@ -175,7 +217,7 @@ class GitHubAppClient:
         )
 
     def _fetch_files_for_pr(
-        self, pr_url: str, token: str
+        self, pr_url: str, token: str, *, initial_sha: str
     ) -> tuple[list[str], list[tuple[str, frozenset[int]]]]:
         """`/pulls/{n}/files` 를 페이지네이션 끝까지 돌며 (changed, addable) 한 쌍을 만든다.
 
@@ -183,6 +225,18 @@ class GitHubAppClient:
           1) changed_files 목록 (file_collector 우선순위 정렬용)
           2) 각 파일의 patch → addable_lines 사전 파싱 (post_review 인라인 분할용)
         per_page=100 은 GitHub 허용 최대치라 PR 이 큰 경우의 라운드트립 수를 최소화.
+
+        ### ABA race 방어 (codex PR #19 review #3)
+
+        멀티 페이지 PR 에서 페이지 1 은 SHA A 기준, 페이지 2 는 SHA B 기준 patch 로
+        받았더라도 마지막 recheck 시점이 다시 A 라면 바깥 비교는 통과하고 서로 다른
+        페이지가 혼합된 스냅샷이 PullRequest 에 박힌다. 이를 막으려면 페이지 사이에도
+        head_sha 를 확인해야 한다.
+
+        여기서는 **다음 페이지를 요청하기 전** 에 `/pulls/{n}` 을 한 번 더 짚어
+        `initial_sha` 와 동일한지 검증한다. 달라져 있으면 `_HeadShaChangedMidFetch` 를
+        올려 바깥 `fetch_pull_request` 루프가 전체 fetch 를 재시도하도록 한다. 단일
+        페이지 PR (`len(files) < 100`) 에서는 추가 호출이 0회라 정상 비용 영향 없음.
         """
         files_url = f"{pr_url}/files?per_page=100"
         changed: list[str] = []
@@ -208,6 +262,11 @@ class GitHubAppClient:
             # 100개 미만이면 마지막 페이지 — Link 헤더 대신 길이로 단순 판정.
             if len(files) < 100:
                 break
+            # 다음 페이지 요청 직전 head_sha 재확인. 페이지 사이 race 를 여기서 잡는다.
+            check = self._request_object("GET", pr_url, auth=f"token {token}")
+            current_sha = str(check["head"]["sha"])
+            if current_sha != initial_sha:
+                raise _HeadShaChangedMidFetch(initial_sha, current_sha)
             page += 1
         return changed, addable
 
