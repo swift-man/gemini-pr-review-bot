@@ -68,60 +68,79 @@ def test_render_body_omits_model_footer_when_model_is_none() -> None:
     assert body == "요약"
 
 
-def test_render_body_replaces_misleading_footer_when_inline_comments_dropped() -> None:
-    """findings 가 비어 있고 dropped_inline_count>0 이면 솔직한 안내 문구를 찍는다.
+def test_render_body_surfaces_dropped_findings_with_path_line_and_body() -> None:
+    """surface_findings 에 들어온 finding 들이 본문에 file:line + 등급·내용으로 노출된다.
 
-    회귀 방지: 422 retry 경로에서 본문이 "_N건 표시_" 라고 거짓말한 채 게시되어 PR
-    리뷰 수신자에게 혼란을 주던 실관측 버그(MLX#27 등) 의 재발을 막는다. 이 테스트는
-    render_body 단계에서 거짓 진술이 사라지고 정확한 사실로 대체되는지를 고정한다.
+    핵심 회귀 방지: PR diff 범위 밖이라 인라인으로 못 붙는 finding 의 정보가 사라지면,
+    수신자는 모델이 본 문제를 알 수 없게 된다. body 가 이미 `[등급]` 접두사를 갖고
+    있으므로(PR #13) 추가 가공 없이 그대로 노출되는지 확인.
     """
+    surfaced = (
+        Finding(path="src/auth.py", line=42, body="[Critical] sys.exit(1) 호출이 ..."),
+        Finding(path="src/utils.py", line=101, body="[Major] race condition ..."),
+    )
     result = ReviewResult(
         summary="요약",
         event=ReviewEvent.REQUEST_CHANGES,
         positives=("좋음",),
-        # findings 는 비어 있음 — POST 직전에 외부에서 비웠다고 가정
+        # findings 는 인라인 가능한 것만 — surface 는 별도 인자로 들어옴
     )
-    body = result.render_body(dropped_inline_count=3)
+    body = result.render_body(surface_findings=surfaced)
 
-    # 거짓 진술 부재
-    assert "기술 단위 코멘트 3건은 각 라인에 별도 표시" not in body
-    # 솔직한 사실 진술
-    assert "3개 인라인 코멘트" in body
-    assert "diff 범위 밖" in body
-    # 본문 다른 섹션은 보존
-    assert "**좋은 점**" in body
-    assert "- 좋음" in body
-
-
-def test_render_body_default_dropped_count_zero_does_not_add_notice() -> None:
-    """기본 호출(=0) 에서는 안내 문구가 추가되지 않는다 — 하위 호환 보장."""
-    result = ReviewResult(
-        summary="요약",
-        event=ReviewEvent.COMMENT,
-    )
-    body = result.render_body()
-
-    assert "diff 범위 밖" not in body
-    assert "거부되어" not in body
+    # 본문에 path:line + body 모두 있어야 한다
+    assert "src/auth.py:42" in body
+    assert "[Critical] sys.exit(1) 호출이" in body
+    assert "src/utils.py:101" in body
+    assert "[Major] race condition" in body
+    # 안내 문구
+    assert "2개 코멘트는 PR diff 범위 밖" in body
+    # 헤더
+    assert "**드롭된 라인 지적**" in body
 
 
-def test_render_body_dropped_count_overrides_findings_footer() -> None:
-    """dropped_inline_count > 0 이면 self.findings 가 있어도 안내 문구로 덮어쓴다.
+def test_render_body_inline_count_excludes_surfaced() -> None:
+    """findings=5 + surface=2 인 경우, 인라인 안내는 (5-2)=3 으로 정확히 표시.
 
-    실 사용처(github_app_client retry) 에서 호출자는 같은 result 객체를 그대로 넘기지만
-    "이 inline 들은 게시되지 않았다" 는 사실을 dropped_inline_count 로 알린다.
-    findings 비우기 위해 dataclasses.replace 를 강제하지 않아도 동작이 정확하도록 한
-    설계 결정 — 호출 단순성과 본문 정확성을 동시에 보장한다.
+    회귀 방지: render_body 가 self.findings 길이를 그대로 인라인 카운트로 쓰면
+    "5건 인라인 표시" 라고 찍히지만 실제 게시는 3건만이라 다시 거짓 진술이 됨.
     """
+    findings = tuple(
+        Finding(path=f"f{i}.py", line=i, body=f"[Minor] {i}") for i in range(1, 6)
+    )
+    surfaced = findings[3:5]  # 마지막 2개가 surface
     result = ReviewResult(
         summary="요약",
         event=ReviewEvent.COMMENT,
-        findings=(Finding(path="a.py", line=5, body="[Major] x"),),
+        findings=findings,
     )
-    body = result.render_body(dropped_inline_count=1)
+    body = result.render_body(surface_findings=surfaced)
 
-    # 거짓 footer 부재 — findings 가 있어도 안내가 우선
-    assert "기술 단위 코멘트 1건은 각 라인에 별도 표시" not in body
-    # 솔직한 안내가 그 자리를 차지
-    assert "1개 인라인 코멘트" in body
-    assert "diff 범위 밖" in body
+    # 인라인 안내는 5 - 2 = 3 건
+    assert "기술 단위 코멘트 3건은 각 라인에 별도 표시" in body
+    # 거짓 5건이 들어가지 않는다
+    assert "기술 단위 코멘트 5건" not in body
+    # surface 카운트도 별도로 표시
+    assert "2개 코멘트는 PR diff 범위 밖" in body
+
+
+def test_render_body_default_no_surface_no_drop_notice() -> None:
+    """기본 호출(surface_findings=()) 에서는 드롭 관련 문구가 일절 추가되지 않음."""
+    result = ReviewResult(summary="요약", event=ReviewEvent.COMMENT)
+    body = result.render_body()
+    assert "diff 범위 밖" not in body
+    assert "드롭된 라인 지적" not in body
+
+
+def test_render_body_all_inline_no_surface_uses_only_inline_count_footer() -> None:
+    """findings 가 모두 인라인 가능 (surface 비어 있음) 인 경우, 기존 footer 만 표시."""
+    result = ReviewResult(
+        summary="요약",
+        event=ReviewEvent.COMMENT,
+        findings=(
+            Finding(path="a.py", line=1, body="[Minor] x"),
+            Finding(path="b.py", line=2, body="[Minor] y"),
+        ),
+    )
+    body = result.render_body(surface_findings=())
+    assert "기술 단위 코멘트 2건은 각 라인에 별도 표시" in body
+    assert "드롭된 라인 지적" not in body

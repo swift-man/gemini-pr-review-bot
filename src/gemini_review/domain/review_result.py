@@ -24,14 +24,17 @@ class ReviewResult:
     findings: tuple[Finding, ...] = field(default_factory=tuple)
     model: str | None = None
 
-    def render_body(self, *, dropped_inline_count: int = 0) -> str:
+    def render_body(self, *, surface_findings: tuple[Finding, ...] = ()) -> str:
         """리뷰 본문 마크다운을 렌더.
 
-        `dropped_inline_count` 는 GitHub Reviews API 가 422 로 거부해서 본문만 게시되는
-        재시도 경로에서 호출자가 주입한다. 이 값이 양수면 `self.findings` 가 비어 있든
-        말든 **항상** 솔직한 안내 ("N개 인라인 코멘트가 거부됨") 로 footer 를 대체한다.
-        호출자가 같은 result 객체를 그대로 넘기더라도 본문이 거짓이 되지 않도록 하기
-        위함 — 리뷰 수신자가 "N건 표시" footer 만 보고 인라인을 찾으러 가는 헛수고를 막음.
+        `surface_findings` 는 GitHub diff 범위 밖이라 인라인으로 게시할 수 없는
+        finding 들 — 호출자(`GitHubAppClient.post_review`) 가 사전 분할로 골라낸다.
+        이 값이 비어 있지 않으면 본문 끝에 **드롭된 라인 지적** 섹션을 추가해
+        `path:line — body` 형태로 나열한다. body 는 이미 `[등급]` 접두사를 포함
+        (PR #13 규약) 하고 있어 추가 가공 없이 그대로 노출한다.
+
+        finding 정보를 잃지 않으면서도 GitHub 의 인라인 룰을 어기지 않는 절충 — PR
+        수신자가 본문 한 곳에서 "정상 인라인 N개 + 본문 surface M개" 모두 확인 가능.
         """
         parts: list[str] = [self.summary.strip()]
         if self.positives:
@@ -41,17 +44,21 @@ class ReviewResult:
             parts.append("\n**개선할 점**")
             parts.extend(f"- {i}" for i in self.improvements)
 
-        if dropped_inline_count > 0:
-            # 재시도 경로 우선 — caller 가 "이 inline 들은 게시되지 않았다" 라고 알려줬으니
-            # findings 의 존재 여부와 무관하게 솔직한 사실로 덮는다.
+        # 인라인으로 살아남는 findings 안내 — surface 와 별개
+        inline_count = len(self.findings) - len(surface_findings)
+        if inline_count > 0:
             parts.append(
-                f"\n_(주: 모델이 제시한 {dropped_inline_count}개 인라인 코멘트가 PR diff "
-                "범위 밖이라 GitHub 검증에 거부되어 본문만 게시됐습니다.)_"
+                f"\n_기술 단위 코멘트 {inline_count}건은 각 라인에 별도 표시됩니다._"
             )
-        elif self.findings:
+
+        if surface_findings:
             parts.append(
-                f"\n_기술 단위 코멘트 {len(self.findings)}건은 각 라인에 별도 표시됩니다._"
+                f"\n_(주: 다음 {len(surface_findings)}개 코멘트는 PR diff 범위 밖이라 "
+                "본문에 모았습니다.)_"
             )
+            parts.append("\n**드롭된 라인 지적**")
+            for f in surface_findings:
+                parts.append(f"- `{f.path}:{f.line}` — {f.body}")
 
         if self.model:
             # 모든 섹션이 끝난 뒤 footer 로 렌더. 구분선(---)으로 본문과 시각적으로 분리.
