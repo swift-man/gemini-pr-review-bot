@@ -375,8 +375,78 @@ def test_parse_does_not_strengthen_comment_to_request_changes() -> None:
     assert result.event == ReviewEvent.COMMENT, "모델이 고른 COMMENT 는 격상하지 않는다"
 
 
-def test_parse_does_not_touch_approve_event() -> None:
-    """APPROVE 는 우리가 손대지 않는다 — 모델 적극 승인 의사를 필터링이 뒤집지 못함."""
+def test_parse_keeps_approve_when_no_blocking_finding() -> None:
+    """APPROVE + finding 0개 (또는 비차단 finding 만) → 그대로 유지.
+
+    모델 적극 승인 의사는 존중. 모순이 없는 한 우리 후처리로 뒤집지 않는다.
+    """
+    raw = """
+    {
+      "summary": "ok",
+      "event": "APPROVE",
+      "comments": [
+        {"path": "a.py", "line": 1, "body": "[Minor] 사소한 메모"}
+      ]
+    }
+    """
+    result = parse_review(raw)
+    assert result.event == ReviewEvent.APPROVE
+
+
+def test_parse_weakens_approve_when_blocking_finding_contradicts(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """APPROVE + 차단급 [Critical]/[Major] finding 살아있는 자기 모순 → COMMENT 약화.
+
+    회귀 방지 (codex PR #20 review #4): 모델이 event 만 실수로 APPROVE 로 내고 comments
+    에는 차단급 지적을 포함하면 GitHub 가 승인 리뷰로 게시해 차단 신호가 사라진다.
+    이 자기 모순 상태는 "APPROVE 손대지 않는다" 원칙의 전제(event ↔ findings 일관성)가
+    깨진 경우 — 더 약한 COMMENT 로 낮춰 본문이 자연스레 역할하게 한다.
+
+    REQUEST_CHANGES 로 격상은 여전히 안 함 — 우리가 차단 적합성을 판단할 정보 부족.
+    """
+    raw = """
+    {
+      "summary": "ok",
+      "event": "APPROVE",
+      "comments": [
+        {"path": "a.py", "line": 1, "body": "[Critical] 실제로는 차단 사유"}
+      ]
+    }
+    """
+    with caplog.at_level(logging.WARNING):
+        result = parse_review(raw)
+
+    # APPROVE 는 COMMENT 로 약화, 강등(REQUEST_CHANGES) 은 여전히 안 함
+    assert result.event == ReviewEvent.COMMENT, (
+        "APPROVE + 차단급 finding 모순 → COMMENT 로 약화해야 한다"
+    )
+    # finding 자체는 그대로 유지 (본문이 역할)
+    assert len(result.findings) == 1
+    assert result.findings[0].body.startswith("[Critical]")
+    # 운영 관측 WARN
+    weaken_warns = [r for r in caplog.records if "weakening APPROVE" in r.getMessage()]
+    assert len(weaken_warns) == 1
+    assert "Critical" in weaken_warns[0].getMessage()
+
+
+def test_parse_weakens_approve_with_major_finding() -> None:
+    """APPROVE + [Major] finding (Critical 아님) 도 동일하게 COMMENT 로 약화."""
+    raw = """
+    {
+      "summary": "ok",
+      "event": "APPROVE",
+      "comments": [
+        {"path": "a.py", "line": 1, "body": "[Major] 차단급 사유"}
+      ]
+    }
+    """
+    result = parse_review(raw)
+    assert result.event == ReviewEvent.COMMENT
+
+
+def test_parse_does_not_touch_approve_empty_event() -> None:
+    """APPROVE + comments 0건 → 그대로 유지 (모순 없음)."""
     raw = """
     {
       "summary": "ok",

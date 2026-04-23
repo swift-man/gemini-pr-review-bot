@@ -81,18 +81,22 @@ def parse_review(
 
 
 def _normalize_event(event: ReviewEvent, findings: tuple[Finding, ...]) -> ReviewEvent:
-    """필터링/강등 이후 finding 분포로 REQUEST_CHANGES 를 약화 (강화는 안 함).
+    """필터링/강등 이후 finding 분포로 event 를 정합. **약화 전용** (강화는 안 함).
 
-    원칙: **약화 전용**. 모델이 COMMENT 를 골랐다면 거기엔 모델만 아는 맥락(예: 본문에는
-    Critical 코멘트가 있지만 PR 자체는 WIP 라 차단할 단계가 아님) 이 있을 수 있어 우리가
-    REQUEST_CHANGES 로 끌어올리지 않는다. 반대로 REQUEST_CHANGES 는 "PR 을 막을 수
-    있는 차단 신호가 최소 1개 있다" 가 필수 전제 — 우리 후처리로 그 전제가 모두
-    파괴됐다면 이 신호를 그대로 두는 건 잘못이다.
+    원칙: 모델이 COMMENT 를 골랐다면 거기엔 모델만 아는 맥락(예: 본문에는 Critical 코멘트가
+    있지만 PR 자체는 WIP 라 차단할 단계가 아님) 이 있을 수 있어 우리가 REQUEST_CHANGES 로
+    끌어올리지 않는다. event 와 findings 가 모순될 때는 **더 약한 쪽으로** 맞춘다:
 
-    APPROVE 는 우리가 손대지 않는다 — 모델이 "통과시켜라" 라고 적극 표현한 건 우리
-    필터링과 무관하게 존중. (우리는 승인의 적합성을 판단할 정보가 없다.)
+    - **REQUEST_CHANGES + 차단 근거 없음** → COMMENT (아래 "약화 보류 규칙" 통과 시)
+    - **APPROVE + 차단급 finding 살아 있음** → COMMENT (codex PR #20 review #4)
 
-    ### 약화 보류 규칙 (보수적 우선)
+    APPROVE + Critical/Major 는 모델의 **자기 모순** 이다: "통과시켜라" 라고 골랐지만
+    본문에는 차단 사유를 적은 상황. 이전 구현은 APPROVE 를 절대 건드리지 않아 GitHub 에
+    승인 리뷰로 게시됐지만, 그건 "태그 다 있고 모순이 없다" 전제에서만 옳다. 모순이
+    관찰되면 승인도 약화. COMMENT 로 내려 "본문을 읽어보세요" 로 자연스레 유도.
+    REQUEST_CHANGES 로 격상은 여전히 안 함 — 우리가 차단의 적합성을 판단할 정보 부족.
+
+    ### REQUEST_CHANGES 약화 보류 규칙 (보수적 우선)
 
     아래 중 하나라도 만족하면 **약화 보류** — 모델 REQUEST_CHANGES 의도를 존중:
 
@@ -106,14 +110,24 @@ def _normalize_event(event: ReviewEvent, findings: tuple[Finding, ...]) -> Revie
     섹션이 아니다. 비어있지 않다는 이유만으로 약화를 막으면 사소한 개선 한 줄 때문에
     PR 이 잘못 차단되는 false positive 가 발생한다. 차단 신호를 본문 차원에서 표현하려면
     스키마에 `must_fix` 같은 차단 전용 필드를 도입하는 게 옳은 방향 — 별도 작업.
-
-    약화 발동 조건: REQUEST_CHANGES + 위 두 가지가 모두 거짓. 즉 모델이 차단을 외쳤지만
-    우리가 finding 후처리로 그 근거를 모조리 지운 깨끗한 상태에서만 약화한다.
     """
+    severities = [_extract_severity(f.body) for f in findings]
+    has_blocking = any(sev in _BLOCKING_SEVERITIES for sev in severities)
+
+    # APPROVE 자기 모순: 승인인데 본문에 차단급 finding 이 살아 있음 → COMMENT 로 약화.
+    if event == ReviewEvent.APPROVE and has_blocking:
+        blocking = [sev for sev in severities if sev in _BLOCKING_SEVERITIES]
+        logger.warning(
+            "weakening APPROVE -> COMMENT: %d blocking finding(s) (%s) contradict the "
+            "approval; posting COMMENT so the body speaks for itself",
+            len(blocking),
+            ", ".join(sorted(set(blocking))),
+        )
+        return ReviewEvent.COMMENT
+
     if event != ReviewEvent.REQUEST_CHANGES:
         return event
-    severities = [_extract_severity(f.body) for f in findings]
-    if any(sev in _BLOCKING_SEVERITIES for sev in severities):
+    if has_blocking:
         return event
     # 태그 누락 finding 이 있으면 보수적으로 유지. 본문에 차단 사유가 숨어 있을 수 있음.
     missing_tag_count = severities.count(None)
