@@ -458,6 +458,73 @@ def test_parse_does_not_touch_approve_empty_event() -> None:
     assert result.event == ReviewEvent.APPROVE
 
 
+def test_parse_weakens_approve_when_untagged_finding_present(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """APPROVE + 태그 누락 finding → COMMENT 로 약화. 양방향 보수 처리 (대칭성).
+
+    회귀 방지 (codex PR #20 review #5): REQUEST_CHANGES 에서는 태그 누락을 "차단일 수
+    있다" 로 보고 보존 (약화 보류) 한다. APPROVE 에서도 같은 신호를 같은 방향으로
+    해석해야 — "차단일 수 있다" 면 승인을 유지하면 안 되고 COMMENT 로 낮춰야 한다.
+
+    이 대칭성이 깨진 채 APPROVE 가 태그 누락을 무시하면, 모델이 차단 사유 본문에
+    `[Critical]` 만 깜빡 빠뜨린 채 event=APPROVE 를 내면 GitHub 에 승인 리뷰로 게시돼
+    차단 신호가 사라지는 false negative 가 발생한다.
+    """
+    raw = """
+    {
+      "summary": "ok",
+      "event": "APPROVE",
+      "comments": [
+        {"path": "a.py", "line": 1, "body": "태그 누락이지만 실제 차단 사유일 수 있음"}
+      ]
+    }
+    """
+    with caplog.at_level(logging.WARNING):
+        result = parse_review(raw)
+
+    # APPROVE 는 COMMENT 로 약화 — REQUEST_CHANGES 에서의 태그 누락 보존과 대칭
+    assert result.event == ReviewEvent.COMMENT, (
+        "태그 누락 finding 이 있으면 APPROVE 도 약화돼야 한다 — REQUEST_CHANGES 의 "
+        "태그 누락 보존 정책과 대칭이어야 false negative 차단 신호 손실을 막을 수 있다"
+    )
+    # finding 자체는 그대로 유지 (본문이 역할)
+    assert len(result.findings) == 1
+    # 운영 관측 WARN — APPROVE 약화 발동 빈도 추적, untagged 사유 명시
+    weaken_warns = [r for r in caplog.records if "weakening APPROVE" in r.getMessage()]
+    assert len(weaken_warns) == 1
+    assert "untagged" in weaken_warns[0].getMessage()
+
+
+def test_parse_weakens_approve_uses_blocking_reason_when_both_present(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """APPROVE + 태그된 [Critical] + 태그 누락 finding 이 같이 있으면 blocking 사유 우선.
+
+    로그 메시지가 두 개 동시에 나오면 운영 노이즈. 더 구체적인 "blocking finding
+    contradict the approval" 메시지가 우선이어야 (둘 중 더 강한 신호).
+    """
+    raw = """
+    {
+      "summary": "ok",
+      "event": "APPROVE",
+      "comments": [
+        {"path": "a.py", "line": 1, "body": "[Critical] 명시적 차단"},
+        {"path": "b.py", "line": 2, "body": "태그 누락 — 모호"}
+      ]
+    }
+    """
+    with caplog.at_level(logging.WARNING):
+        result = parse_review(raw)
+
+    assert result.event == ReviewEvent.COMMENT
+    # blocking 메시지가 떠야 (untagged 메시지가 아님)
+    msgs = [r.getMessage() for r in caplog.records if "weakening APPROVE" in r.getMessage()]
+    assert len(msgs) == 1, "약화 WARN 은 정확히 1건"
+    assert "blocking finding" in msgs[0]
+    assert "untagged" not in msgs[0]
+
+
 def test_parse_weakens_request_changes_when_no_findings_at_all() -> None:
     """REQUEST_CHANGES 인데 인라인 0건이면 약화. improvements 는 차단 근거 아님.
 

@@ -89,21 +89,33 @@ def _normalize_event(event: ReviewEvent, findings: tuple[Finding, ...]) -> Revie
 
     - **REQUEST_CHANGES + 차단 근거 없음** → COMMENT (아래 "약화 보류 규칙" 통과 시)
     - **APPROVE + 차단급 finding 살아 있음** → COMMENT (codex PR #20 review #4)
+    - **APPROVE + 태그 누락 finding 있음** → COMMENT (codex PR #20 review #5)
 
-    APPROVE + Critical/Major 는 모델의 **자기 모순** 이다: "통과시켜라" 라고 골랐지만
-    본문에는 차단 사유를 적은 상황. 이전 구현은 APPROVE 를 절대 건드리지 않아 GitHub 에
-    승인 리뷰로 게시됐지만, 그건 "태그 다 있고 모순이 없다" 전제에서만 옳다. 모순이
-    관찰되면 승인도 약화. COMMENT 로 내려 "본문을 읽어보세요" 로 자연스레 유도.
-    REQUEST_CHANGES 로 격상은 여전히 안 함 — 우리가 차단의 적합성을 판단할 정보 부족.
+    ### 태그 누락 finding 의 양방향 보수적 처리 (대칭성)
+
+    파서는 본문 앞에 `[등급]` 접두사 없는 finding 도 드롭하지 않고 WARN 만 찍은 채
+    게시한다. 이런 finding 은 "차단 사유가 숨어 있을 수도, 단순 메모일 수도" 있다 —
+    어느 쪽인지 우리가 판단할 수 없다. 그러므로 **양방향으로 보수적**:
+
+    - REQUEST_CHANGES 에서: 태그 누락 finding 이 있으면 약화 보류 (차단을 지우면 안 됨)
+    - APPROVE 에서: 태그 누락 finding 이 있으면 약화 발동 (승인을 유지하면 안 됨)
+
+    같은 신호의 비대칭 처리는 위험하다 (codex PR #20 review #5): REQUEST_CHANGES 에서는
+    "차단일 수 있다" 로 보수적이면서 APPROVE 에서는 "비차단으로 추정" 한다면, 모델이
+    태그만 깜빡한 차단 사유 본문을 승인 리뷰로 게시하는 false negative 가 생긴다.
+    양쪽 모두 "차단일 가능성을 우대한다" 가 일관된 정책.
+
+    APPROVE + Critical/Major 또는 태그 누락은 모델의 **자기 모순** 이다: "통과시켜라"
+    라고 골랐지만 본문에는 차단 가능성이 적힌 상황. COMMENT 로 내려 "본문을 읽어보세요"
+    로 자연스레 유도. REQUEST_CHANGES 로 격상은 여전히 안 함 — 차단의 적합성을 판단할
+    정보 부족.
 
     ### REQUEST_CHANGES 약화 보류 규칙 (보수적 우선)
 
     아래 중 하나라도 만족하면 **약화 보류** — 모델 REQUEST_CHANGES 의도를 존중:
 
     1. **finding 에 `[Critical]`/`[Major]` 가 살아 있음** — 인라인 차단 사유 명확히 존재.
-    2. **태그 누락 finding 이 있음** — 본문 앞 `[등급]` 접두사 누락은 파서 정책상
-       드롭하지 않고 게시 (WARN 만). "태그 없음 = 비차단" 으로 단순 해석하면 모델이
-       태그만 깜빡한 차단급 본문을 약화로 지워버리는 false negative 발생.
+    2. **태그 누락 finding 이 있음** — 위 대칭성 규칙.
 
     `improvements` 는 차단 근거로 쓰지 **않는다** (codex PR #20 review #3): 현재 프롬프트
     스키마상 `improvements` 는 라인 고정이 어려운 **권장 개선** 섹션이지 차단 전용
@@ -113,16 +125,28 @@ def _normalize_event(event: ReviewEvent, findings: tuple[Finding, ...]) -> Revie
     """
     severities = [_extract_severity(f.body) for f in findings]
     has_blocking = any(sev in _BLOCKING_SEVERITIES for sev in severities)
+    missing_tag_count = severities.count(None)
 
-    # APPROVE 자기 모순: 승인인데 본문에 차단급 finding 이 살아 있음 → COMMENT 로 약화.
-    if event == ReviewEvent.APPROVE and has_blocking:
-        blocking = [sev for sev in severities if sev in _BLOCKING_SEVERITIES]
-        logger.warning(
-            "weakening APPROVE -> COMMENT: %d blocking finding(s) (%s) contradict the "
-            "approval; posting COMMENT so the body speaks for itself",
-            len(blocking),
-            ", ".join(sorted(set(blocking))),
-        )
+    # APPROVE 자기 모순:
+    #   (a) 승인인데 본문에 차단급 finding 이 명시적으로 살아 있음, 또는
+    #   (b) 태그 누락 finding 이 있음 — 차단 사유가 숨어 있을 가능성 (대칭성).
+    # 둘 다 → COMMENT 로 약화. 양방향 보수적 처리 (codex PR #20 review #5).
+    if event == ReviewEvent.APPROVE and (has_blocking or missing_tag_count > 0):
+        if has_blocking:
+            blocking = [sev for sev in severities if sev in _BLOCKING_SEVERITIES]
+            logger.warning(
+                "weakening APPROVE -> COMMENT: %d blocking finding(s) (%s) "
+                "contradict the approval; posting COMMENT so the body speaks for itself",
+                len(blocking),
+                ", ".join(sorted(set(blocking))),
+            )
+        else:
+            logger.warning(
+                "weakening APPROVE -> COMMENT: %d untagged finding(s) may hide "
+                "blocking intent; posting COMMENT for symmetry with REQUEST_CHANGES "
+                "policy (untagged is treated as potentially blocking on both sides)",
+                missing_tag_count,
+            )
         return ReviewEvent.COMMENT
 
     if event != ReviewEvent.REQUEST_CHANGES:
@@ -130,7 +154,6 @@ def _normalize_event(event: ReviewEvent, findings: tuple[Finding, ...]) -> Revie
     if has_blocking:
         return event
     # 태그 누락 finding 이 있으면 보수적으로 유지. 본문에 차단 사유가 숨어 있을 수 있음.
-    missing_tag_count = severities.count(None)
     if missing_tag_count > 0:
         logger.warning(
             "keeping REQUEST_CHANGES despite no tagged blocking finding: "
