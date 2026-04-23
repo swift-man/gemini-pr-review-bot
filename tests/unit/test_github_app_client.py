@@ -607,6 +607,49 @@ def test_fetch_pull_request_rechecks_head_sha_after_files(
     assert pr.head_sha == "abc"
 
 
+def test_fetch_pull_request_normalizes_null_title_and_body_to_empty_string(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """GitHub 응답에서 title/body 가 `null` 이면 빈 문자열로 매핑.
+
+    회귀 방지 (gemini PR #19 review #2): `dict.get("title", "")` 는 키가 존재하고 값이
+    None 이면 None 을 반환한다. 그 결과 `str(None) == "None"` 이 PullRequest.title 에
+    박혀 다운스트림 (프롬프트, 본문 surface 등) 에 "None" 이 노출되는 회귀가 생긴다.
+    `or ""` 패턴으로 None 도 안전하게 빈 문자열로 처리해야 한다.
+    """
+
+    def fake_urlopen(
+        req: urllib.request.Request,
+        *,
+        timeout: float | None = None,
+        context: ssl.SSLContext | None = None,
+    ) -> _FakeResponse:
+        if "access_tokens" in req.full_url:
+            return _FakeResponse(b'{"token": "tkn", "expires_at": ""}')
+        if "/files" in req.full_url:
+            return _FakeResponse(
+                b'[{"filename": "a.py", "patch": "@@ -1,0 +1,1 @@\\n+x\\n"}]'
+            )
+        # title 과 body 모두 명시적 null — 빈 본문 PR 이 GitHub 에서 이런 응답을 준다.
+        return _FakeResponse(json.dumps({
+            "title": None,
+            "body": None,
+            "draft": False,
+            "head": {"sha": "abc", "ref": "feat", "repo": {"clone_url": "https://x.git"}},
+            "base": {"sha": "def", "ref": "main"},
+        }).encode())
+
+    monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+    monkeypatch.setattr(jwt, "encode", lambda *a, **k: "fake.jwt")
+
+    client = GitHubAppClient(app_id=1, private_key_pem="-")
+    pr = client.fetch_pull_request(RepoRef("o", "r"), 9, installation_id=7)
+
+    # "None" 문자열이 박히면 회귀 — 빈 문자열이어야
+    assert pr.title == "", "null title 은 빈 문자열로 매핑돼야 (str(None) 회귀 방지)"
+    assert pr.body == "", "null body 도 빈 문자열로 매핑돼야"
+
+
 def test_fetch_pull_request_uses_recheck_metadata_when_head_sha_matches(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

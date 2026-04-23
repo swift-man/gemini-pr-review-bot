@@ -126,10 +126,15 @@ class GitHubAppClient:
                 # review #2). head_sha 는 동일하므로 안전.
                 head = recheck["head"]
                 base = recheck["base"]
+                # GitHub 응답에서 title/body 는 종종 명시적 `null` 로 온다 (예: 본문이
+                # 비어 있는 PR). `dict.get(key, default)` 는 키가 있고 값이 None 이면 None
+                # 을 그대로 반환하므로 `default` 가 적용되지 않는다. `str(None)` 이 들어가
+                # `"None"` 문자열로 오염되는 회귀를 막기 위해 `or ""` 패턴으로 일관 처리
+                # (gemini PR #19 review #2 — body 와 동일한 패턴 채택).
                 return PullRequest(
                     repo=repo,
                     number=number,
-                    title=str(recheck.get("title", "")),
+                    title=str(recheck.get("title") or ""),
                     body=str(recheck.get("body") or ""),
                     head_sha=str(head["sha"]),
                     head_ref=str(head["ref"]),
