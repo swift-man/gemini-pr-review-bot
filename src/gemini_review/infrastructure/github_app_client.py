@@ -155,6 +155,9 @@ class GitHubAppClient:
                 len(comments),
             )
             payload["comments"] = []
+            # 본문 재렌더 — render_body() 의 "N건 표시" footer 가 거짓이 되지 않도록.
+            # dropped_inline_count 를 넘기면 솔직한 "(주: N개 거부됨)" 안내로 대체된다.
+            payload["body"] = result.render_body(dropped_inline_count=len(comments))
             self._request_object("POST", url, auth=f"token {token}", body=payload)
 
     def post_comment(self, pr: PullRequest, body: str) -> None:
