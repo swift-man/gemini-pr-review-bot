@@ -90,11 +90,33 @@ def _normalize_event(event: ReviewEvent, findings: tuple[Finding, ...]) -> Revie
 
     APPROVE 는 우리가 손대지 않는다 — 모델이 "통과시켜라" 라고 적극 표현한 건 우리
     필터링과 무관하게 존중. (우리는 승인의 적합성을 판단할 정보가 없다.)
+
+    ### 태그 누락 finding 에 대한 보수적 처리
+
+    파서는 본문 앞에 `[등급]` 접두사가 없는 finding 도 드롭하지 않고 WARN 만 찍은 채
+    게시한다 (운영 관측 후 정책 강화). 따라서 "등급 태그 없음 = 비차단" 이라는
+    단순 해석은 위험하다: 모델이 REQUEST_CHANGES 를 내며 본문에 "여기서 데이터 손실
+    난다" 라고 썼는데 `[Critical]` 태그만 빠졌다면, 우리가 COMMENT 로 약화하면서
+    차단 신호를 지우는 false negative 가 생긴다. 그래서 **태그 누락 finding 이 하나
+    라도 있으면 약화를 보류**한다 — 모델 의도를 더 우선한다.
+
+    약화가 발동하는 유일한 조건: 모든 finding 이 `[등급]` 태그를 갖고 있고, 그 중
+    `[Critical]`/`[Major]` 가 0개. (태그가 다 있는 깨끗한 상태에서만 확실히 판단.)
     """
     if event != ReviewEvent.REQUEST_CHANGES:
         return event
-    has_blocking = any(_extract_severity(f.body) in _BLOCKING_SEVERITIES for f in findings)
+    severities = [_extract_severity(f.body) for f in findings]
+    has_blocking = any(sev in _BLOCKING_SEVERITIES for sev in severities)
     if has_blocking:
+        return event
+    # 태그 누락 finding 이 있으면 보수적으로 유지. 본문에 차단 사유가 숨어 있을 수 있음.
+    missing_tag_count = sum(1 for sev in severities if sev is None)
+    if missing_tag_count > 0:
+        logger.warning(
+            "keeping REQUEST_CHANGES despite no tagged blocking finding: "
+            "%d findings lack severity tag and may hide blocking intent",
+            missing_tag_count,
+        )
         return event
     logger.warning(
         "weakening REQUEST_CHANGES -> COMMENT: no [Critical]/[Major] findings survive "

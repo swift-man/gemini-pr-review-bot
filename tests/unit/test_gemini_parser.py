@@ -403,3 +403,62 @@ def test_parse_weakens_request_changes_when_no_findings_at_all() -> None:
     """
     result = parse_review(raw)
     assert result.event == ReviewEvent.COMMENT
+
+
+def test_parse_keeps_request_changes_when_untagged_finding_hides_blocking_intent(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """태그 누락 finding 이 하나라도 있으면 약화 보류 — codex #20 회귀 방지.
+
+    파서 정책: 본문에 `[등급]` 접두사 없어도 finding 은 드롭하지 않고 WARN 만 찍는다.
+    그 말은 "태그 없음 = 비차단" 으로 단순 해석하면 위험하다는 뜻 — 모델이
+    REQUEST_CHANGES 를 내며 본문에 "데이터 손실 난다" 라고 썼는데 `[Critical]` 만
+    깜빡 빠진 경우, 약화해버리면 차단 신호를 잃는 false negative 가 된다.
+
+    보수적 처리: 태그 누락이 하나라도 있으면 REQUEST_CHANGES 유지. 운영 관측 WARN 도
+    함께 찍어 빈도 추적 가능.
+    """
+    raw = """
+    {
+      "summary": "ok",
+      "event": "REQUEST_CHANGES",
+      "comments": [
+        {"path": "a.py", "line": 1, "body": "태그 누락이지만 실제 차단 사유일 수 있음"}
+      ]
+    }
+    """
+    with caplog.at_level(logging.WARNING):
+        result = parse_review(raw)
+
+    assert result.event == ReviewEvent.REQUEST_CHANGES, (
+        "태그 누락 finding 이 있으면 약화 보류해 차단 신호를 지우지 않아야 한다"
+    )
+    # 보류 사실이 운영 관측 로그로 남아야 — 태그 누락 빈도 모니터링용
+    keep_warns = [
+        r for r in caplog.records if "keeping REQUEST_CHANGES" in r.getMessage()
+    ]
+    assert len(keep_warns) == 1
+    assert "1" in keep_warns[0].getMessage()  # 태그 누락 1건
+
+
+def test_parse_weakens_only_when_all_findings_tagged_and_none_blocking() -> None:
+    """태그가 **전부** 있고 그 중 blocking 이 0개일 때만 약화 발동.
+
+    회귀 방지: 태그 있는 Minor/Suggestion 만 남은 순수한 "비차단" 상태에선 약화가 정상
+    발동해야 한다. 태그 누락 보류 규칙이 너무 광범위하게 적용돼 약화 자체가 무력화
+    되는 것을 막는다.
+    """
+    raw = """
+    {
+      "summary": "ok",
+      "event": "REQUEST_CHANGES",
+      "comments": [
+        {"path": "a.py", "line": 1, "body": "[Minor] 사소"},
+        {"path": "b.py", "line": 2, "body": "[Suggestion] 권고"}
+      ]
+    }
+    """
+    result = parse_review(raw)
+    assert result.event == ReviewEvent.COMMENT, (
+        "태그 다 있고 blocking 0개면 약화 발동"
+    )
