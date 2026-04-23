@@ -1,5 +1,6 @@
 import io
 import json
+import logging
 import ssl
 import urllib.error
 import urllib.request
@@ -541,6 +542,111 @@ def test_fetch_pull_request_collects_addable_lines_with_single_files_call(
     assert addable["src/a.py"] == frozenset({5, 6})
     # binary 파일은 patch=None → 빈 frozenset (보수적)
     assert addable["binary.png"] == frozenset()
+
+
+def _make_fake_urlopen_for_pr_meta(head_repo: Any) -> Any:
+    """_resolve_clone_url 테스트용 urlopen — head.repo 값을 자유롭게 제어.
+
+    `head_repo` 를 `None` 또는 빈 dict 또는 정상 dict 로 넘겨서 fork 시나리오를 시뮬.
+    """
+
+    def fake_urlopen(
+        req: urllib.request.Request,
+        *,
+        timeout: float | None = None,
+        context: ssl.SSLContext | None = None,
+    ) -> _FakeResponse:
+        if "access_tokens" in req.full_url:
+            return _FakeResponse(b'{"token": "tkn", "expires_at": ""}')
+        if "/files" in req.full_url:
+            return _FakeResponse(b'[]')
+        return _FakeResponse(json.dumps({
+            "title": "t",
+            "body": "b",
+            "draft": False,
+            "head": {"sha": "abc", "ref": "feat", "repo": head_repo},
+            "base": {"sha": "def", "ref": "main", "repo": {"clone_url": "https://base/x.git"}},
+        }).encode())
+
+    return fake_urlopen
+
+
+def test_fetch_pull_request_falls_back_to_base_repo_when_head_fork_deleted(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """삭제된 fork 시나리오: `head.repo == null` 응답에서도 TypeError 없이 살아남는다.
+
+    실 GitHub API 동작: 사용자가 fork PR 을 제출한 뒤 그 fork 를 삭제하면 다음 `/pulls/{n}`
+    응답의 `head.repo` 가 명시적 `null` 로 온다. 이전 구현은 `head["repo"]["clone_url"]`
+    을 직접 인덱싱해 `TypeError: 'NoneType' object is not subscriptable` 로 fetch 가 통째로
+    실패하고 PR 한 건이 유실됐다.
+
+    회귀 방지: base.repo.clone_url 로 fallback, WARN 로그 1건으로 운영 관측 가능.
+    """
+    monkeypatch.setattr(urllib.request, "urlopen", _make_fake_urlopen_for_pr_meta(None))
+    monkeypatch.setattr(jwt, "encode", lambda *a, **k: "fake.jwt")
+
+    client = GitHubAppClient(app_id=1, private_key_pem="-")
+    with caplog.at_level(logging.WARNING):
+        pr = client.fetch_pull_request(RepoRef("o", "r"), 9, installation_id=7)
+
+    # fallback URL 이 박혀야 (head URL 에는 접근 불가능했으므로)
+    assert pr.clone_url == "https://base/x.git"
+    # 운영 관측 WARN — "fork 삭제된 PR" 빈도 추적 가능
+    warns = [r for r in caplog.records if "deleted fork" in r.getMessage()]
+    assert len(warns) == 1, "fallback 발생 시 WARN 한 줄이 남아야 한다"
+    assert "o/r" in warns[0].getMessage() and "#9" in warns[0].getMessage()
+
+
+def test_fetch_pull_request_falls_back_when_head_repo_missing_clone_url(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """head.repo 가 dict 로는 존재하지만 clone_url 키가 없는 비정상 응답도 방어.
+
+    GitHub API 의 공식 스키마상 드물지만, 부분 응답·미래 스키마 변경 등 방어적 처리.
+    `head.repo` dict 에 clone_url 키가 없거나 빈 문자열이면 fallback.
+    """
+    monkeypatch.setattr(
+        urllib.request,
+        "urlopen",
+        _make_fake_urlopen_for_pr_meta({"owner": "user"}),  # clone_url 키 없음
+    )
+    monkeypatch.setattr(jwt, "encode", lambda *a, **k: "fake.jwt")
+
+    client = GitHubAppClient(app_id=1, private_key_pem="-")
+    with caplog.at_level(logging.WARNING):
+        pr = client.fetch_pull_request(RepoRef("o", "r"), 9, installation_id=7)
+
+    assert pr.clone_url == "https://base/x.git"
+    assert any("deleted fork" in r.getMessage() for r in caplog.records)
+
+
+def test_fetch_pull_request_uses_head_clone_url_in_normal_case(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """정상 케이스: head.repo 존재 → head.repo.clone_url 사용, WARN 없음.
+
+    회귀 방지: fallback 규칙이 너무 넓게 발동해서 정상 PR 의 head URL 까지 덮어쓰면
+    fork 의 head-only commit 을 클론하지 못하는 부작용이 생긴다. 정상 응답에선 head
+    URL 이 그대로 박혀야 하고, "deleted fork" WARN 도 나오면 안 된다.
+    """
+    monkeypatch.setattr(
+        urllib.request,
+        "urlopen",
+        _make_fake_urlopen_for_pr_meta({"clone_url": "https://fork/x.git"}),
+    )
+    monkeypatch.setattr(jwt, "encode", lambda *a, **k: "fake.jwt")
+
+    client = GitHubAppClient(app_id=1, private_key_pem="-")
+    with caplog.at_level(logging.WARNING):
+        pr = client.fetch_pull_request(RepoRef("o", "r"), 9, installation_id=7)
+
+    assert pr.clone_url == "https://fork/x.git", "정상 케이스엔 head URL 이 박혀야"
+    deleted_fork_warns = [r for r in caplog.records if "deleted fork" in r.getMessage()]
+    assert deleted_fork_warns == [], "정상 케이스엔 fallback WARN 이 없어야 한다"
 
 
 def test_http_attaches_response_detail_to_httperror(

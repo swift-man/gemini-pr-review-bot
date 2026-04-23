@@ -135,7 +135,7 @@ class GitHubAppClient:
             head_ref=str(head["ref"]),
             base_sha=str(base["sha"]),
             base_ref=str(base["ref"]),
-            clone_url=str(head["repo"]["clone_url"]),
+            clone_url=_resolve_clone_url(repo, number, head, base),
             changed_files=tuple(changed),
             installation_id=installation_id,
             is_draft=bool(pr_data.get("draft", False)),
@@ -294,6 +294,42 @@ class GitHubAppClient:
             exc.gemini_review_detail = detail  # type: ignore[attr-defined]
             logger.error("GitHub %s %s failed: %s %s", method, url, exc.code, detail[:500])
             raise
+
+
+def _resolve_clone_url(
+    repo: RepoRef,
+    number: int,
+    head: dict[str, Any],
+    base: dict[str, Any],
+) -> str:
+    """`head.repo.clone_url` 을 안전하게 추출. fork 가 삭제된 경우 base 로 fallback.
+
+    GitHub PR API 응답에서 `head["repo"]` 는 사용자가 fork 후 그 fork 를 **삭제한 경우
+    `null`** 로 온다. `head["repo"]["clone_url"]` 을 직접 인덱싱하면 `TypeError:
+    'NoneType' object is not subscriptable` 로 fetch 가 통째로 실패한다 (운영 중 PR 한
+    건이 통째로 유실).
+
+    Fallback: `base.repo.clone_url`. base 는 PR 대상 리포 자체이므로 항상 존재하고
+    설치된 GitHub App 토큰으로 클론 권한이 보장된다 (private fork 의 권한 부족 문제도
+    함께 우회). 단점: head fork 가 사라졌다면 거기에만 있던 commit 을 base repo 에서
+    바로 못 받을 수 있고, 이 경우 후속 클론/체크아웃이 실패한다 — 그 실패는 자연스럽고
+    명시적이라 조용한 TypeError 보다 낫다 (운영자가 즉시 인지 가능).
+
+    `repo` 와 `number` 는 fallback 발생 로그에 PR 식별자를 남기기 위해서만 사용.
+    """
+    head_repo = head.get("repo")
+    if isinstance(head_repo, dict):
+        clone_url = head_repo.get("clone_url")
+        if clone_url:
+            return str(clone_url)
+
+    logger.warning(
+        "PR %s#%d head.repo is missing or has no clone_url (likely deleted fork); "
+        "falling back to base.repo.clone_url — head-only commits may be unreachable",
+        repo.full_name,
+        number,
+    )
+    return str(base["repo"]["clone_url"])
 
 
 def _finding_to_comment(f: Finding) -> dict[str, object]:
