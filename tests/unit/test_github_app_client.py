@@ -153,17 +153,28 @@ def _sample_pr() -> PullRequest:
     )
 
 
-def test_post_review_drops_inline_comments_and_retries_on_422(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """모델이 diff 범위 밖 라인을 지적해 422 가 나면 comments 를 비우고 재시도한다.
+def _files_response(patches: dict[str, str | None]) -> bytes:
+    """`/pulls/{n}/files` 응답 바디를 만들어 주는 테스트 헬퍼.
 
-    Reviews API 는 bulk 등록이라 inline comment 하나가 잘못된 라인을 가리키면 전체
-    등록이 거부된다. 어느 comment 가 문제인지 API 가 구분해서 알려주지 않으므로,
-    본문(요약 / 좋은 점 / 개선할 점) 만이라도 PR 에 남기기 위해 comments 를 비우고
-    1회 재시도하는 정책을 고정한다.
+    각 파일명에 대해 `{filename, patch}` 객체 배열로 직렬화. patch=None 인 경우는
+    binary/삭제/truncated 파일을 시뮬레이션하기 위함.
     """
-    posted_bodies: list[dict[str, Any]] = []
+    items = [{"filename": name, "patch": patch} for name, patch in patches.items()]
+    return json.dumps(items).encode()
+
+
+def _make_fake_urlopen(
+    posted_bodies: list[dict[str, Any]],
+    patches: dict[str, str | None],
+    fail_first_review_with_422: bool = False,
+):
+    """post_review 흐름을 가짜 GitHub 으로 시뮬레이션하는 urlopen 대체.
+
+    - access_tokens: 정상 토큰 응답
+    - /pulls/{n}/files: 주어진 patches 를 응답
+    - /pulls/{n}/reviews: posted_bodies 에 캡처. fail_first_review_with_422=True 면
+      첫 호출만 422 raise.
+    """
 
     def fake_urlopen(
         req: urllib.request.Request,
@@ -171,72 +182,168 @@ def test_post_review_drops_inline_comments_and_retries_on_422(
         timeout: float | None = None,
         context: ssl.SSLContext | None = None,
     ) -> _FakeResponse:
-        # installation token 호출은 정상 응답으로 처리
         if "access_tokens" in req.full_url:
             return _FakeResponse(b'{"token": "tkn", "expires_at": ""}')
-
-        # review POST 호출만 캡처 — 첫 번째는 422, 두 번째는 성공
+        if "/files" in req.full_url:
+            return _FakeResponse(_files_response(patches))
+        # review POST
         assert req.data is not None
-        body = json.loads(req.data.decode("utf-8"))
-        posted_bodies.append(body)
-        if len(posted_bodies) == 1:
+        posted_bodies.append(json.loads(req.data.decode("utf-8")))
+        if fail_first_review_with_422 and len(posted_bodies) == 1:
             raise urllib.error.HTTPError(
                 req.full_url,
                 422,
                 "Unprocessable Entity",
                 {},  # type: ignore[arg-type]
-                io.BytesIO(
-                    b'{"message": "Validation Failed", "errors": ['
-                    b'{"resource": "PullRequestReviewComment", '
-                    b'"code": "custom", '
-                    b'"message": "pull_request_review_thread.line must be part of the diff"}]}'
-                ),
+                io.BytesIO(b'{"message": "Validation Failed"}'),
             )
         return _FakeResponse(b'{"id": 1}')
 
-    monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+    return fake_urlopen
+
+
+def test_post_review_partitions_findings_into_inline_and_surfaced(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """addable_lines 에 따라 finding 이 inline 과 surfaced 로 정확히 분할된다.
+
+    핵심 회귀 방지: 사전 분할이 깨지면 (1) 422 가 다시 발생하거나 (2) 본문 surface
+    가 누락되거나 (3) 같은 finding 이 두 곳에 중복 노출되는 사고가 일어난다.
+    """
+    posted_bodies: list[dict[str, Any]] = []
+    # a.py 의 patch — 라인 5, 6 만 추가. line 42 는 diff 밖.
+    patches = {"a.py": "@@ -1,0 +5,2 @@\n+x\n+y\n"}
+    monkeypatch.setattr(
+        urllib.request, "urlopen", _make_fake_urlopen(posted_bodies, patches)
+    )
+    monkeypatch.setattr(jwt, "encode", lambda *a, **k: "fake.jwt")
+
+    client = GitHubAppClient(app_id=1, private_key_pem="-")
+    result = ReviewResult(
+        summary="요약",
+        event=ReviewEvent.REQUEST_CHANGES,
+        positives=("좋음",),
+        improvements=("개선",),
+        findings=(
+            Finding(path="a.py", line=5, body="[Major] 라인 5 — 인라인 가능"),
+            Finding(path="a.py", line=42, body="[Critical] 라인 42 — diff 밖"),
+        ),
+    )
+
+    client.post_review(_sample_pr(), result)
+
+    # 단일 POST — 422 retry 발동 안 함
+    assert len(posted_bodies) == 1, "사전 분할이 정확하면 retry 가 일어나면 안 된다"
+
+    # comments 에는 line 5 만
+    posted = posted_bodies[0]
+    assert len(posted["comments"]) == 1
+    assert posted["comments"][0]["path"] == "a.py"
+    assert posted["comments"][0]["line"] == 5
+
+    # body 에 line 42 가 surface 됨
+    body = str(posted["body"])
+    assert "a.py:42" in body
+    assert "[Critical] 라인 42" in body
+    # 인라인 카운트 안내는 1건 (5 - 4 = ... 이 아니라 inline_findings 길이 = 1)
+    assert "기술 단위 코멘트 1건" in body
+    # surface 안내
+    assert "1개 코멘트는 PR diff 범위 밖" in body
+
+
+def test_post_review_all_inline_when_all_lines_addable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """모든 finding 이 addable 라인을 가리키면 surface 섹션 없이 인라인만 게시."""
+    posted_bodies: list[dict[str, Any]] = []
+    patches = {"a.py": "@@ -1,0 +1,3 @@\n+x\n+y\n+z\n"}  # line 1,2,3 모두 addable
+    monkeypatch.setattr(
+        urllib.request, "urlopen", _make_fake_urlopen(posted_bodies, patches)
+    )
     monkeypatch.setattr(jwt, "encode", lambda *a, **k: "fake.jwt")
 
     client = GitHubAppClient(app_id=1, private_key_pem="-")
     result = ReviewResult(
         summary="요약",
         event=ReviewEvent.COMMENT,
-        positives=("좋음",),
-        improvements=("개선",),
-        findings=(Finding(path="a.py", line=42, body="diff 범위 밖 라인"),),
+        findings=(
+            Finding(path="a.py", line=1, body="[Minor] x"),
+            Finding(path="a.py", line=2, body="[Minor] y"),
+        ),
     )
 
-    # 예외가 삼켜져야 함 (본문만이라도 게시)
     client.post_review(_sample_pr(), result)
 
-    assert len(posted_bodies) == 2, "초기 POST + 재시도 = 2회 호출돼야 함"
+    body = str(posted_bodies[0]["body"])
+    assert len(posted_bodies[0]["comments"]) == 2
+    assert "기술 단위 코멘트 2건은 각 라인에 별도 표시" in body
+    assert "드롭된 라인 지적" not in body  # surface 섹션 없음
 
-    # 1차: comments 포함
+
+def test_post_review_all_surfaced_when_no_addable_lines(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """파일이 binary 등으로 patch=None 이면 모든 finding 이 surface — 인라인 0건."""
+    posted_bodies: list[dict[str, Any]] = []
+    patches = {"binary.png": None}  # binary file 시뮬레이션
+    monkeypatch.setattr(
+        urllib.request, "urlopen", _make_fake_urlopen(posted_bodies, patches)
+    )
+    monkeypatch.setattr(jwt, "encode", lambda *a, **k: "fake.jwt")
+
+    client = GitHubAppClient(app_id=1, private_key_pem="-")
+    result = ReviewResult(
+        summary="요약",
+        event=ReviewEvent.COMMENT,
+        findings=(
+            Finding(path="binary.png", line=1, body="[Minor] meta data"),
+        ),
+    )
+
+    client.post_review(_sample_pr(), result)
+
+    posted = posted_bodies[0]
+    assert posted["comments"] == []
+    body = str(posted["body"])
+    assert "binary.png:1" in body
+    assert "[Minor] meta data" in body
+
+
+def test_post_review_safety_net_moves_inline_to_body_on_unexpected_422(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """사전 분할이 잘못 판정한 희소 케이스 (예: GitHub patch truncate) — 422 가 나면
+    남은 inline 들도 body 로 옮기고 retry. 정보 손실 없이 게시 보장."""
+    posted_bodies: list[dict[str, Any]] = []
+    # patch 는 line 1 만 addable 이라고 알려주지만, GitHub 는 422 로 거부 (시뮬레이션)
+    patches = {"a.py": "@@ -1,0 +1,1 @@\n+x\n"}
+    monkeypatch.setattr(
+        urllib.request,
+        "urlopen",
+        _make_fake_urlopen(posted_bodies, patches, fail_first_review_with_422=True),
+    )
+    monkeypatch.setattr(jwt, "encode", lambda *a, **k: "fake.jwt")
+
+    client = GitHubAppClient(app_id=1, private_key_pem="-")
+    result = ReviewResult(
+        summary="요약",
+        event=ReviewEvent.REQUEST_CHANGES,
+        findings=(
+            Finding(path="a.py", line=1, body="[Critical] 우리는 addable 이라 봤지만 GitHub 가 거부"),
+        ),
+    )
+
+    # 예외 삼켜져야 함 (retry 성공)
+    client.post_review(_sample_pr(), result)
+
+    assert len(posted_bodies) == 2, "1차 + retry = 2회"
+    # 1차: 우리 분할 결과대로 inline 1건 시도
     assert len(posted_bodies[0]["comments"]) == 1
-    assert posted_bodies[0]["comments"][0]["path"] == "a.py"
-    assert posted_bodies[0]["comments"][0]["line"] == 42
-
-    # 2차: comments 비워지고 body 도 재렌더 — 1차의 거짓 footer ("N건 표시") 가
-    # 솔직한 안내 ("N개 거부됨") 로 교체됐는지 확인. commit_id/event 등 다른 필드는 동일.
+    # 2차: comments 비우고 그 내용을 body 로 surface
     assert posted_bodies[1]["comments"] == []
-    assert posted_bodies[1]["commit_id"] == posted_bodies[0]["commit_id"]
-    assert posted_bodies[1]["event"] == posted_bodies[0]["event"]
-
-    body_initial = str(posted_bodies[0]["body"])
     body_retry = str(posted_bodies[1]["body"])
-
-    # 1차는 거짓 진술이 있었다 (실제 게시 단계에서 inline 코멘트가 살아남는다고 약속)
-    assert "기술 단위 코멘트 1건은 각 라인에 별도 표시됩니다" in body_initial
-
-    # 2차에선 그 진술이 제거되고 솔직한 사실 안내로 대체
-    assert "기술 단위 코멘트 1건은 각 라인에 별도 표시됩니다" not in body_retry
-    assert "1개 인라인 코멘트" in body_retry
-    assert "diff 범위 밖" in body_retry
-
-    # 본문의 다른 섹션 (요약/positives/improvements) 은 보존돼야 함
-    assert "요약" in body_retry
-    assert "**좋은 점**" in body_retry
-    assert "**개선할 점**" in body_retry
+    assert "a.py:1" in body_retry
+    assert "[Critical] 우리는 addable" in body_retry
 
 
 def test_post_review_does_not_retry_when_no_comments(

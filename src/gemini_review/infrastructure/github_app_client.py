@@ -13,6 +13,8 @@ import jwt
 
 from gemini_review.domain import Finding, PullRequest, RepoRef, ReviewEvent, ReviewResult
 
+from .diff_parser import addable_lines_from_patch
+
 logger = logging.getLogger(__name__)
 
 # macOS · python.org 빌드 Python 은 시스템 CA 번들을 자동으로 신뢰하지 않아
@@ -128,37 +130,92 @@ class GitHubAppClient:
 
         token = self.get_installation_token(pr.installation_id)
         url = f"{self._api_base}/repos/{pr.repo.full_name}/pulls/{pr.number}/reviews"
+
+        # 모델은 전체 코드베이스를 보고 임의 라인을 지적할 수 있지만 GitHub Reviews API 는
+        # diff 안 라인에만 인라인 코멘트를 허용한다. 사전에 PR 의 patch 들을 파싱해 유효
+        # (path, line) 집합을 구해 두고, finding 을 두 갈래로 분할한다:
+        #   - inline_findings: 그 집합에 들어가는 것 → 정상 인라인 코멘트로 게시
+        #   - surfaced_findings: 그 외 → 본문으로 promote 해 file:line + 등급·내용 노출
+        # 이 사전 분할 덕분에 422 자체가 거의 발생하지 않고, 발생하더라도 retry 가
+        # 안전망으로 남는다 (예: GitHub patch 가 truncate 돼서 우리가 "허용" 으로 분류한
+        # 라인이 실제론 거부되는 희소 케이스).
+        if result.findings:
+            addable_lines = self._fetch_addable_lines(pr)
+            inline_findings, surfaced_findings = _partition_findings(
+                result.findings, addable_lines
+            )
+        else:
+            # findings 가 비어 있으면 /files 호출 자체가 낭비. 불필요한 라운드트립 절약.
+            inline_findings = ()
+            surfaced_findings = ()
+        if surfaced_findings:
+            logger.info(
+                "post_review %s#%d: %d inline + %d surfaced (diff 범위 밖)",
+                pr.repo.full_name,
+                pr.number,
+                len(inline_findings),
+                len(surfaced_findings),
+            )
+
         # commit_id 를 명시해야 리뷰가 "이 head SHA 시점"에 고정된다. 생략하면 최신 SHA 기준으로
         # 붙어 라인 번호 오정렬이 발생할 수 있다.
-        comments = [_finding_to_comment(f) for f in result.findings]
+        comments = [_finding_to_comment(f) for f in inline_findings]
         payload: dict[str, object] = {
             "commit_id": pr.head_sha,
-            "body": result.render_body(),
+            "body": result.render_body(surface_findings=surfaced_findings),
             "event": result.event.value,
             "comments": comments,
         }
         try:
             self._request_object("POST", url, auth=f"token {token}", body=payload)
         except urllib.error.HTTPError as exc:
-            # Reviews API 는 bulk 등록이라 inline comment 하나가 diff 범위 밖 라인을 가리키면
-            # UNPROCESSABLE_ENTITY 로 전체 등록이 거부된다 (본문·positives·improvements 까지
-            # 날아감). 어느 comment 가 문제였는지 API 가 구분해서 알려주지 않으므로, 본문만
-            # 이라도 살리기 위해 comments 를 비우고 1회 재시도한다.
+            # 사전 분할이 99% 의 422 를 막지만, 안전망으로 retry 도 유지. 만약 여전히 422 가
+            # 나면 inline_findings 안에 우리가 잘못 "허용" 으로 분류한 finding 이 있다는
+            # 뜻이므로, 그것들도 본문으로 surface 해서 정보가 사라지지 않게 한다.
             if exc.code != HTTPStatus.UNPROCESSABLE_ENTITY or not comments:
                 raise
             logger.warning(
-                "review POST returned %d for %s#%d; dropping %d inline comments and "
-                "retrying with body only",
+                "review POST returned %d for %s#%d despite pre-filtering; "
+                "moving %d remaining inline comments into body and retrying",
                 HTTPStatus.UNPROCESSABLE_ENTITY.value,
                 pr.repo.full_name,
                 pr.number,
-                len(comments),
+                len(inline_findings),
             )
             payload["comments"] = []
-            # 본문 재렌더 — render_body() 의 "N건 표시" footer 가 거짓이 되지 않도록.
-            # dropped_inline_count 를 넘기면 솔직한 "(주: N개 거부됨)" 안내로 대체된다.
-            payload["body"] = result.render_body(dropped_inline_count=len(comments))
+            payload["body"] = result.render_body(
+                surface_findings=surfaced_findings + inline_findings
+            )
             self._request_object("POST", url, auth=f"token {token}", body=payload)
+
+    def _fetch_addable_lines(self, pr: PullRequest) -> dict[str, set[int]]:
+        """PR 의 각 변경 파일에 대해 인라인 코멘트가 허용되는 RIGHT-side 라인 집합 반환.
+
+        Reviews API 의 검증 룰("comments.line 은 diff 안에 있어야 함") 을 우리 쪽에서
+        동등하게 재현. patch 를 파싱하므로 binary/삭제/truncated patch 인 경우엔 빈
+        집합 → 해당 파일에 대한 모든 finding 이 본문으로 surface 된다.
+        """
+        token = self.get_installation_token(pr.installation_id)
+        files_url = (
+            f"{self._api_base}/repos/{pr.repo.full_name}/pulls/{pr.number}/files?per_page=100"
+        )
+        addable: dict[str, set[int]] = {}
+        page = 1
+        while True:
+            files = self._request_list("GET", f"{files_url}&page={page}", auth=f"token {token}")
+            if not files:
+                break
+            for entry in files:
+                filename = str(entry.get("filename", ""))
+                patch = entry.get("patch")
+                if filename:
+                    addable[filename] = addable_lines_from_patch(
+                        patch if isinstance(patch, str) else None
+                    )
+            if len(files) < 100:
+                break
+            page += 1
+        return addable
 
     def post_comment(self, pr: PullRequest, body: str) -> None:
         if self._dry_run:
@@ -246,6 +303,27 @@ class GitHubAppClient:
 
 def _finding_to_comment(f: Finding) -> dict[str, object]:
     return {"path": f.path, "line": f.line, "side": "RIGHT", "body": f.body}
+
+
+def _partition_findings(
+    findings: tuple[Finding, ...],
+    addable_lines: dict[str, set[int]],
+) -> tuple[tuple[Finding, ...], tuple[Finding, ...]]:
+    """findings 를 (인라인 가능, surfaced) 두 튜플로 분할.
+
+    `(path, line)` 이 `addable_lines` 에 들어가면 인라인. 아니면 surfaced (본문에 노출).
+    이 함수가 순서를 보존하므로, 본문 surface 의 표시 순서가 모델이 만든 원래 순서와
+    동일하다 — 우선순위 의도가 깨지지 않음. tuple 반환은 ReviewResult.render_body 의
+    `surface_findings: tuple[Finding, ...]` 시그니처와 직접 호환되도록.
+    """
+    inline: list[Finding] = []
+    surfaced: list[Finding] = []
+    for f in findings:
+        if f.line in addable_lines.get(f.path, set()):
+            inline.append(f)
+        else:
+            surfaced.append(f)
+    return tuple(inline), tuple(surfaced)
 
 
 __all__ = ["GitHubAppClient", "ReviewEvent"]
