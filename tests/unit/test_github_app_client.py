@@ -601,8 +601,10 @@ def test_fetch_pull_request_rechecks_head_sha_after_files(
     client = GitHubAppClient(app_id=1, private_key_pem="-")
     pr = client.fetch_pull_request(RepoRef("o", "r"), 9, installation_id=7)
 
-    # /pulls/{n} 를 두 번 짚어야 (앞: head_sha 확보, 뒤: 일관성 재확인)
-    assert counters["pulls"] == 2, "head_sha 일관성 재확인 호출이 누락됐다"
+    # /pulls/{n} 호출 3회: (1) initial, (2) post-page check (첫 페이지 응답 직후 검증,
+    # codex PR #19 review #7), (3) final recheck. 검증 호출이 누락되면 3 → 2 로 떨어져
+    # 이 assertion 이 잡아낸다.
+    assert counters["pulls"] == 3, "head_sha 일관성 재확인 호출이 누락됐다"
     assert counters["files"] == 1, "정상 케이스에선 /files 가 한 번만 호출돼야 한다"
     assert pr.head_sha == "abc"
 
@@ -704,20 +706,22 @@ def test_fetch_pull_request_retries_when_head_sha_changes_mid_fetch(
     monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    """`/pulls/{n}` 과 `/files` 사이 head_sha 가 바뀌면 한 번 재시도해 일관된 스냅샷을 얻어야 한다.
+    """fetch 시작-끝 사이 head_sha 가 바뀌면 재시도해 일관된 스냅샷을 얻어야 한다.
 
     회귀 방지: 재시도 로직이 빠지면 첫 시도의 어긋난 데이터를 그대로 PullRequest 에
     박아 후속 인라인 분할이 깨진다. 두 번째 시도에서 head_sha 가 안정되면 그 SHA 의
     일관된 스냅샷으로 정상 반환해야 한다.
 
-    호출 절감 검증도 포함: 1차의 recheck 결과를 2차의 시작점으로 재사용하므로 /pulls
-    호출은 (1차 initial + 1차 recheck + 2차 recheck) = 3 회. 4 회로 보이면 재사용
-    최적화가 회귀.
+    시나리오는 **start/end 모드** 를 deliberately 발동 — 단일 페이지 PR 에서 post-page
+    check 는 match 하되 final recheck 에서 mismatch. mid-pagination 과 분리된 경로.
     """
-    # 1차: pulls=abc → files → pulls=def (변경 감지) ⇒ 재시도, recheck=def 를 carry
-    # 2차: (carried pr_data, sha=def) → files → pulls=def (안정) ⇒ 확정
+    # 시나리오:
+    #   1차: pulls=abc (initial) → files → pulls=abc (post-page, match) → pulls=def (recheck, mismatch)
+    #        → retry, pr_data = recheck (def)
+    #   2차: (carried pr_data, sha=def) → files → pulls=def (post-page) → pulls=def (recheck, match)
+    #        → return
     fake, counters = _build_fake_urlopen_for_fetch_pr(
-        head_shas=["abc", "def", "def", "def"]
+        head_shas=["abc", "abc", "def", "def", "def"]
     )
     monkeypatch.setattr(urllib.request, "urlopen", fake)
     monkeypatch.setattr(jwt, "encode", lambda *a, **k: "fake.jwt")
@@ -726,8 +730,9 @@ def test_fetch_pull_request_retries_when_head_sha_changes_mid_fetch(
     with caplog.at_level(logging.WARNING):
         pr = client.fetch_pull_request(RepoRef("o", "r"), 9, installation_id=7)
 
-    # /pulls 3번 (initial 1 + recheck 1 + 2차 recheck 1) — recheck 재사용으로 4→3
-    assert counters["pulls"] == 3
+    # /pulls 호출 5회: 1차 (initial + post-page + recheck) + 2차 carry init skip
+    # (post-page + recheck) = 3+2 = 5. recheck 재사용 최적화가 깨지면 6+ 이 될 것.
+    assert counters["pulls"] == 5
     assert counters["files"] == 2
     # 두 번째 시도의 안정된 SHA 가 박혀야 한다
     assert pr.head_sha == "def"
@@ -742,7 +747,7 @@ def test_fetch_pull_request_raises_when_head_sha_keeps_changing(
     monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    """매 시도마다 head_sha 가 바뀌면(force-push 폭주) 무한 retry 대신 명시적 실패.
+    """매 시도마다 start/end 모드로 실패하면 무한 retry 대신 명시적 실패.
 
     조용히 잘못된 데이터로 진행하는 것이 가장 위험한 실패 모드 — 차라리 webhook 큐
     수준에서 빼버리고 다음 push 의 새 webhook 이 새 시작점이 되도록 하는 게 안전.
@@ -751,10 +756,15 @@ def test_fetch_pull_request_raises_when_head_sha_keeps_changing(
     - 마지막 시도에서 "retrying" 로그가 더 안 찍히는지 (gemini PR #19 review #2)
     - 실패 메시지가 fetch 시작-끝 모드임을 명시 (codex PR #19 review #4) — ABA 페이지
       race 와 다른 디버깅 경로이므로 진단 메시지가 구분돼야
+    - `__cause__` is None (mid-pagination 예외 미발생 시 chain 안 됨)
+
+    시나리오: 단일 페이지 PR 에서 post-page 는 match 하되 매 attempt 의 final recheck
+    에서 mismatch. 즉 race 가 fetch 시작-끝 구간에서만 발생하는 경우.
     """
-    # 매번 다른 SHA 를 돌려주는 시퀀스 — 어떤 시도도 안정되지 않음. 단일 페이지 PR.
+    # 매 attempt 에서 post-page 는 초기 SHA 와 match, final recheck 는 다른 SHA 로.
+    # 시퀀스: [init1, post1, recheck1, post2(after carry), recheck2, post3, recheck3]
     fake, _counters = _build_fake_urlopen_for_fetch_pr(
-        head_shas=["s1", "s2", "s3", "s4", "s5", "s6", "s7", "s8", "s9", "s10"]
+        head_shas=["s1", "s1", "s2", "s2", "s3", "s3", "s4"]
     )
     monkeypatch.setattr(urllib.request, "urlopen", fake)
     monkeypatch.setattr(jwt, "encode", lambda *a, **k: "fake.jwt")
@@ -764,12 +774,12 @@ def test_fetch_pull_request_raises_when_head_sha_keeps_changing(
         with pytest.raises(RuntimeError, match="head_sha kept changing") as exc_info:
             client.fetch_pull_request(RepoRef("o", "r"), 9, installation_id=7)
 
-    # 진단 메시지: fetch 시작-끝 SHA 변동 (ABA 페이지 모드 아님). 단일 페이지 PR 이므로
-    # 페이지 사이 체크는 발동하지 않고, /pulls 시작-끝 비교에서만 실패.
+    # 진단 메시지: fetch 시작-끝 SHA 변동. post-page 는 매번 match 했으므로 mid-pagination
+    # 경로는 한 번도 안 밟음.
     assert "fetch start/end SHA mismatch" in str(exc_info.value)
-    # ABA cause 가 chain 되면 안 됨 (단일 페이지 PR 에선 mid-pagination 예외 미발생)
+    # ABA cause 가 chain 되면 안 됨 (mid-pagination 예외 미발생)
     assert exc_info.value.__cause__ is None, (
-        "단일 페이지 PR 에선 mid-pagination 예외가 발생하지 않으므로 cause chain 도 없어야"
+        "mid-pagination 예외가 발생하지 않았으니 cause chain 도 없어야"
     )
 
     # _MAX_FETCH_ATTEMPTS=3 → 1차·2차 mismatch 시 "retrying" 로그, 3차는 곧바로 raise.
@@ -827,64 +837,18 @@ def test_fetch_pull_request_reports_start_end_mode_when_last_failure_is_start_en
     남아 있어 exhaustion 메시지가 잘못된 모드를 가리킨다. 시도 시작 시 None 으로 초기화
     해야 한다.
 
-    시나리오:
-      - 시도 1 (멀티 페이지): pulls=A, files1, files2, pulls=B (post-page ABA raise)
-        → last_mid_pagination_exc 에 시도 1 의 예외 기록
-      - 시도 2 (단일 페이지): pulls=B, files1 (50개, 조기 종료), pulls=C (recheck start/end)
-        → mid-pagination 예외는 발생 안 함. 만약 리셋 안 되면 옛 시도 1 예외가 남음.
-      - 시도 3 (단일 페이지): pulls=C, files1 (50개), pulls=D (recheck) → start/end 실패
-        → exhausted. 메시지는 start/end 모드여야.
+    시나리오 (단일 페이지 PR, post-page + final recheck 둘 다 post-page check 함수):
+      - 시도 1: pulls=A (initial), post-page=B (shas[1]) → mid-pagination raise
+        → last_mid_pagination_exc 에 시도 1 예외 기록, pr_data=None
+      - 시도 2: pulls=B (initial 새로), post-page=B (match), recheck=C (mismatch)
+        → start/end raise. 만약 리셋 안 되면 옛 시도 1 예외가 여전히 남음.
+      - 시도 3: pulls=C (carried), post-page=C (match), recheck=D (mismatch)
+        → start/end raise, exhausted. 마지막 모드는 start/end.
     """
-    # 시도 1 은 multi-page ABA, 시도 2+3 은 single-page start/end mismatch.
-    # 이 fake urlopen 은 attempt 1 에서 page=1 100개, page=2 50개 (multi-page).
-    # 시도 2+3 에서도 같은 응답이 나옴 → 모든 시도가 multi-page 가 됨.
-    # 이 테스트를 정확히 세우려면 attempt 1 만 multi-page, 2+3 은 single-page 로 흘러야.
-    # 복잡한 시뮬이라 별도 fake 가 필요.
-    counters: dict[str, int] = {"pulls": 0, "attempt_calls": 0}
-
-    def fake_urlopen(
-        req: urllib.request.Request,
-        *,
-        timeout: float | None = None,
-        context: ssl.SSLContext | None = None,
-    ) -> _FakeResponse:
-        if "access_tokens" in req.full_url:
-            return _FakeResponse(b'{"token": "tkn", "expires_at": ""}')
-        if "/files" in req.full_url:
-            # 시도 1 에서만 100개 반환 (multi-page), 이후는 50개 (single page 조기 종료).
-            # `&page=1` 인 경우만 multi-page 로 만듦. `&page=2` 는 50개.
-            if "&page=1" in req.full_url:
-                counters["attempt_calls"] += 1
-                # 시도 1 의 page=1 에서만 100개 → ABA 가 다음에 발동.
-                # 시도 2, 3 의 page=1 은 50개 → 조기 종료 → single-page 경로.
-                if counters["attempt_calls"] == 1:
-                    items = [{"filename": f"p1_{i}.py", "patch": "@@ -1 +1 @@\n+x\n"} for i in range(100)]
-                else:
-                    items = [{"filename": f"sp_{i}.py", "patch": "@@ -1 +1 @@\n+y\n"} for i in range(50)]
-                return _FakeResponse(json.dumps(items).encode())
-            if "&page=2" in req.full_url:
-                items = [{"filename": f"p2_{i}.py", "patch": "@@ -1 +1 @@\n+z\n"} for i in range(50)]
-                return _FakeResponse(json.dumps(items).encode())
-            return _FakeResponse(b'[]')
-        # /pulls — 시도별로 다른 SHA 반환
-        # 시도 1: [0]=A (initial), [1]=B (post-page) → mid-pagination raise
-        #   → pr_data = None (ABA 경로), last_mid_pagination_exc 에 저장
-        # 시도 2: [2]=B (initial 새로), [3]=C (final recheck, mismatch) → start/end raise
-        #   → pr_data = C (carry), last_mid_pagination_exc 는 리셋돼야 함 (이 시도는 ABA 아님)
-        # 시도 3: pr_data 가 C (carry), initial_sha=C, [4]=D (final recheck, mismatch)
-        #   → start/end raise, exhausted. 마지막 모드는 start/end.
-        # 시퀀스에서 [4] 를 D 로 둬서 시도 3 도 반드시 실패시킴.
-        shas = ["A", "B", "B", "C", "D"]
-        idx = min(counters["pulls"], len(shas) - 1)
-        sha = shas[idx]
-        counters["pulls"] += 1
-        return _FakeResponse(json.dumps({
-            "title": "t", "body": "b", "draft": False,
-            "head": {"sha": sha, "ref": "feat", "repo": {"clone_url": "https://x.git"}},
-            "base": {"sha": "base", "ref": "main"},
-        }).encode())
-
-    monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+    fake, _counters = _build_fake_urlopen_for_fetch_pr(
+        head_shas=["A", "B", "B", "B", "C", "C", "D"]
+    )
+    monkeypatch.setattr(urllib.request, "urlopen", fake)
     monkeypatch.setattr(jwt, "encode", lambda *a, **k: "fake.jwt")
 
     client = GitHubAppClient(app_id=1, private_key_pem="-")
@@ -1009,29 +973,85 @@ def test_fetch_pull_request_detects_aba_race_mid_pagination(
     assert len(pr.changed_files) == 150
 
 
-def test_fetch_pull_request_single_page_skips_between_page_checks(
+def test_fetch_pull_request_detects_single_page_aba(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """단일 페이지 PR 에선 between-page 체크가 발동하지 않아 호출 비용 그대로.
+    """단일 페이지 PR 의 ABA race: `initial=A → /files=B → recheck=A` 를 post-page check 로 잡는다.
 
-    회귀 방지: ABA 방어 코드가 단일 페이지 PR (실제 거의 대부분) 에서도 매번 추가 /pulls
-    호출을 유발하면 불필요한 API 비용 증가. `len(files) < 100` 조기 종료 경로에서는
-    between-page 체크가 실행되지 않아야 한다.
+    회귀 방지 (codex PR #19 review #7): 이전엔 `page > 1` 에서만 post-page check 를
+    수행해 단일 페이지 PR 의 ABA race (바깥 start/end 비교만으로는 못 잡음) 를 놓쳤다.
+    첫 페이지도 검증 대상이라는 정책의 정합성.
 
-    /pulls 호출 2회 (initial + final recheck) 만 발생해야 한다.
+    시나리오: initial=A, page=1 받음 (A 기준이든 B 기준이든 상관없음), post-page check
+    에서 SHA=B 발견 → mid-pagination raise. 재시도 후 2차에서는 SHA 가 안정돼 정상 반환.
     """
-    fake, counters = _build_fake_urlopen_for_fetch_pr(head_shas=["abc"])
+    # 시도 1: init=A, post-page=B → mid-pagination raise
+    # 시도 2: init=A (새로, pr_data=None 이었음), post-page=A, recheck=A → return
+    fake, counters = _build_fake_urlopen_for_fetch_pr(
+        head_shas=["A", "B", "A", "A", "A"]
+    )
     monkeypatch.setattr(urllib.request, "urlopen", fake)
     monkeypatch.setattr(jwt, "encode", lambda *a, **k: "fake.jwt")
 
     client = GitHubAppClient(app_id=1, private_key_pem="-")
     pr = client.fetch_pull_request(RepoRef("o", "r"), 9, installation_id=7)
 
-    assert pr.head_sha == "abc"
-    # between-page 체크가 추가 호출을 만들었다면 3 이상. 정확히 2여야 한다.
-    assert counters["pulls"] == 2, (
-        "단일 페이지 PR 에선 between-page /pulls 체크가 발동하면 안 된다"
+    assert pr.head_sha == "A", "재시도 후 안정된 A 로 반환"
+    # ABA 가 post-page 에서 감지됐는지 확인: /pulls 5회 (1차 2회 + 2차 initial+post-page+recheck=3회)
+    assert counters["pulls"] == 5
+    assert counters["files"] == 2
+
+
+def test_fetch_pull_request_skips_check_on_empty_final_page(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """정확히 100 배수 파일을 가진 PR 에서 빈 마지막 페이지는 post-page check 를 스킵.
+
+    회귀 방지 (codex PR #19 review #8): `if not files: break` 를 SHA check 보다 먼저
+    두면 누적할 게 없는 빈 페이지에 대해 불필요한 /pulls 호출이 발생하지 않는다. 이
+    최적화가 깨지면 정확히 100 배수 파일 PR 의 API 비용이 늘고, 빈 페이지에서 head_sha
+    가 움직였다 하더라도 누적된 데이터는 이전 페이지 기준이라 사실상 오탐.
+
+    시나리오: page=1 에서 100개 반환 → page=2 에서 빈 배열. page=2 응답 직후에 empty
+    check 가 먼저 발동해 loop 이 break, post-page check 는 일어나지 않아야.
+    """
+    counters: dict[str, int] = {"pulls": 0, "files": 0}
+
+    def fake_urlopen(
+        req: urllib.request.Request,
+        *,
+        timeout: float | None = None,
+        context: ssl.SSLContext | None = None,
+    ) -> _FakeResponse:
+        if "access_tokens" in req.full_url:
+            return _FakeResponse(b'{"token": "tkn", "expires_at": ""}')
+        if "/files" in req.full_url:
+            counters["files"] += 1
+            if "&page=1" in req.full_url:
+                items = [{"filename": f"p_{i}.py", "patch": "@@ -1 +1 @@\n+x\n"} for i in range(100)]
+                return _FakeResponse(json.dumps(items).encode())
+            return _FakeResponse(b'[]')  # page=2 는 빈 배열
+        counters["pulls"] += 1
+        return _FakeResponse(json.dumps({
+            "title": "t", "body": "b", "draft": False,
+            "head": {"sha": "A", "ref": "feat", "repo": {"clone_url": "https://x.git"}},
+            "base": {"sha": "base", "ref": "main"},
+        }).encode())
+
+    monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+    monkeypatch.setattr(jwt, "encode", lambda *a, **k: "fake.jwt")
+
+    client = GitHubAppClient(app_id=1, private_key_pem="-")
+    pr = client.fetch_pull_request(RepoRef("o", "r"), 9, installation_id=7)
+
+    assert pr.head_sha == "A"
+    assert len(pr.changed_files) == 100
+    # /pulls 호출 = initial + post-page-1 + (no check on empty page=2) + final recheck = 3
+    # 만약 empty check 가 없었다면 4 회 (page=2 의 post-page check 포함).
+    assert counters["pulls"] == 3, (
+        "빈 페이지에서는 post-page check 를 스킵해야 정확히 100 배수 파일 PR 의 비용 낭비 방지"
     )
+    assert counters["files"] == 2  # page=1 + page=2 (empty)
 
 
 def test_http_attaches_response_detail_to_httperror(

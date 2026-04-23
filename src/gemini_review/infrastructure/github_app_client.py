@@ -258,13 +258,18 @@ class GitHubAppClient:
         에만 검증했는데, 그러면 검증 직후 push 가 발생해 다음 페이지를 다른 SHA 기준으로
         받아오는 창이 남았다 (codex PR #19 review #5).
 
-        페이지 1 은 `initial_sha` 직후라 race window 가 매우 짧아 별도 검증 생략 — 이미
-        `fetch_pull_request` 의 "fetch 시작-끝 SHA" 비교가 그 창을 cover. 단일 페이지 PR
-        에선 페이지 2 자체가 없으니 추가 호출 0회라 정상 비용 영향 없음.
+        **첫 페이지도 검증** (codex PR #19 review #7): 페이지 1 은 `initial_sha` 직후라
+        race window 가 좁긴 하지만, 단일 페이지 PR 에서 `initial=A → /files=B → recheck=A`
+        형태의 ABA 는 외부 비교만으로는 잡히지 않는다. 비용은 PR 당 `/pulls` 1회 추가.
 
-        호출 비용 비교 (변경 위치만 다르고 횟수는 동일):
-          - 1 페이지 PR: initial(1) + page1(1) + final recheck(1) = 3
-          - N 페이지 PR: initial(1) + N pages + (N-1) post-page checks + final(1) = 2N+1
+        **빈 페이지 최적화** (codex PR #19 review #8): `if not files: break` 를 SHA 검증
+        보다 먼저 실행해 정확히 100 배수 파일을 가진 PR 이 빈 마지막 페이지에 대해 불필요한
+        검증 호출을 하지 않도록 한다. 빈 페이지는 누적될 게 없으니 검증 의미 없음.
+
+        호출 비용 비교:
+          - 1 페이지 PR: initial(1) + page1(1) + post-page check(1) + final recheck(1) = 4
+          - N 페이지 PR (N>=2): initial(1) + N pages + N post-page checks + final(1) = 2N+2
+          - 정확히 100 배수 파일 PR: 빈 페이지는 break 먼저 → check 스킵
         """
         files_url = f"{pr_url}/files?per_page=100"
         changed: list[str] = []
@@ -272,17 +277,16 @@ class GitHubAppClient:
         page = 1
         while True:
             files = self._request_list("GET", f"{files_url}&page={page}", auth=f"token {token}")
-            # 페이지 응답 직후, 누적 전에 head_sha 검증. 페이지 1 은 initial_sha 가
-            # 직전에 잡혔으므로 race window 가 매우 좁아 검증 생략 (바깥 final recheck 로
-            # 충분). 페이지 2+ 는 무조건 검증 — 누적 후 검증하면 stale 데이터가 결과에
-            # 섞여도 같은 raise 로 끝나지만 구조 명확성을 위해 누적 전 검증을 고수.
-            if page > 1:
-                check = self._request_object("GET", pr_url, auth=f"token {token}")
-                current_sha = str(check["head"]["sha"])
-                if current_sha != initial_sha:
-                    raise _HeadShaChangedMidFetch(initial_sha, current_sha)
+            # 빈 페이지 → 누적도 검증도 의미 없음. early-exit.
             if not files:
                 break
+            # 페이지 응답 직후, 누적 전에 head_sha 검증. 단일 페이지 ABA 까지 커버하려면
+            # 첫 페이지도 검증 필요 (codex PR #19 review #7). race window 를 페이지 응답
+            # ~ 검증 사이 마이크로초 단위로 축소.
+            check = self._request_object("GET", pr_url, auth=f"token {token}")
+            current_sha = str(check["head"]["sha"])
+            if current_sha != initial_sha:
+                raise _HeadShaChangedMidFetch(initial_sha, current_sha)
             for file_entry in files:
                 filename = str(file_entry["filename"])
                 changed.append(filename)
