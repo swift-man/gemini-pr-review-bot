@@ -1,4 +1,5 @@
 import logging
+import re
 import subprocess
 from pathlib import Path
 from urllib.parse import urlsplit, urlunsplit
@@ -6,6 +7,12 @@ from urllib.parse import urlsplit, urlunsplit
 from gemini_review.domain import PullRequest
 
 logger = logging.getLogger(__name__)
+
+# 로그에 남기기 전에 `https://x-access-token:<TOKEN>@host/...` 의 credentials 부분을 마스킹.
+# `_run` 의 DEBUG 로그가 git clone / remote set-url 명령의 인증 URL 을 그대로 기록해 토큰이
+# 로그 파일·외부 로그 수집기로 유출되는 보안 회귀를 차단 (codex PR #21 review #5 [Critical]).
+# netloc 의 `user:password@` 구간만 치환 — 도메인/경로는 유지해 디버깅 가치는 보존.
+_AUTH_URL_CREDS = re.compile(r"(https?://)[^/@\s]+:[^/@\s]+@")
 
 
 class GitRepoFetcher:
@@ -23,7 +30,10 @@ class GitRepoFetcher:
         # 만으로도 토큰이 디스크에 평문으로 남을 수 있다. `token_remote_set` 같은 boolean
         # 추적 대신 .git 디렉터리 존재 여부를 진실 소스로 삼는다 — clone 이 어디서 죽든
         # 부분 `.git` 만 남으면 정리 대상으로 인식 (codex PR #21 review #3, gemini suggestion).
-        primary_exc: BaseException | None = None
+        # `BaseException` 대신 `Exception` 사용 — `KeyboardInterrupt`/`SystemExit` 같은 시스템
+        # 종료 신호까지 가로채서 `primary_exc` 에 보관하면 원래 의도를 왜곡할 수 있어 관례
+        # 대로 `Exception` 으로 좁힌다 (gemini PR #21 review nit).
+        primary_exc: Exception | None = None
 
         try:
             if not (repo_path / ".git").exists():
@@ -54,7 +64,7 @@ class GitRepoFetcher:
             # 리뷰 입력에 섞이지 않도록 한다.
             _run(["git", "-C", str(repo_path), "clean", "-fdx"])
             return repo_path
-        except BaseException as e:
+        except Exception as e:
             primary_exc = e
             raise
         finally:
@@ -69,7 +79,7 @@ class GitRepoFetcher:
 def _restore_origin_url(
     repo_path: Path,
     original_url: str,
-    primary_exc: BaseException | None,
+    primary_exc: Exception | None,
 ) -> None:
     """`origin` URL 을 토큰 없는 원본으로 되돌린다. 정상 경로 vs 오류 경로 분기 처리.
 
@@ -107,8 +117,22 @@ def _inject_token(clone_url: str, token: str) -> str:
     return urlunsplit((parts.scheme, netloc, parts.path, parts.query, parts.fragment))
 
 
+def _mask_auth_in_arg(arg: str) -> str:
+    """URL 에 박힌 `user:password@` credentials 를 `***:***@` 로 치환해 로그 안전화.
+
+    `_inject_token` 이 만든 `https://x-access-token:<TOKEN>@host/...` 형태를 그대로 로그에
+    내보내면 설치 토큰이 유출된다 (codex PR #21 review #5 [Critical]). git 명령 인자는
+    대부분 URL 이 아니라서 대부분의 인자는 unchanged — 정규식이 `https?://user:pass@`
+    패턴을 찾지 못하면 그대로 반환.
+    """
+    return _AUTH_URL_CREDS.sub(r"\1***:***@", arg)
+
+
 def _run(cmd: list[str], *, check: bool = True) -> None:
-    logger.debug("git %s", " ".join(cmd[1:]))
+    # git 서브커맨드와 인자들을 DEBUG 로 기록하되, 인증 URL credentials 는 마스킹.
+    # `cmd[1:]` 은 보통 `-C <path> <subcmd> <...args>` 형태.
+    masked = " ".join(_mask_auth_in_arg(a) for a in cmd[1:])
+    logger.debug("git %s", masked)
     result = subprocess.run(cmd, capture_output=True, text=True)  # noqa: S603
     if check and result.returncode != 0:
         raise RuntimeError(

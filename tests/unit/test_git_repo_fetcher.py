@@ -4,6 +4,7 @@
 그 ref 로 fetch + FETCH_HEAD 로 checkout. fork 가 삭제된 PR 에서 base.repo 의
 `refs/pull/{n}/head` 로 PR 스냅샷을 받는 경로의 회귀 방지 (codex PR #21 review #1).
 """
+import logging
 import subprocess
 from pathlib import Path
 from typing import Any
@@ -11,7 +12,10 @@ from typing import Any
 import pytest
 
 from gemini_review.domain import PullRequest, RepoRef
-from gemini_review.infrastructure.git_repo_fetcher import GitRepoFetcher
+from gemini_review.infrastructure.git_repo_fetcher import (
+    GitRepoFetcher,
+    _mask_auth_in_arg,
+)
 
 
 def _make_pr(*, fetch_ref: str = "", clone_url: str = "https://example/x.git") -> PullRequest:
@@ -313,3 +317,81 @@ def test_checkout_preserves_primary_exception_when_restore_also_fails(
         if r.levelname == "ERROR" and "installation token may remain" in r.getMessage()
     ]
     assert len(error_logs) == 1, "복구 실패는 ERROR 로그로 남아야 grep 가능"
+
+
+# --- 로그 토큰 마스킹 (codex PR #21 review #5 [Critical]) --------------------
+
+
+def test_mask_auth_in_arg_replaces_credentials_in_https_url() -> None:
+    """인증 URL 의 `user:password@` 구간만 `***:***@` 로 치환, 나머지는 보존."""
+    masked = _mask_auth_in_arg(
+        "https://x-access-token:ghs_SECRETTOKEN123@github.com/owner/repo.git"
+    )
+    assert "ghs_SECRETTOKEN123" not in masked
+    assert "x-access-token" not in masked
+    # 도메인과 경로는 디버깅 가치가 있어 유지
+    assert "github.com/owner/repo.git" in masked
+    assert "***:***@" in masked
+
+
+def test_mask_auth_in_arg_leaves_non_url_args_untouched() -> None:
+    """URL 이 아닌 git 인자 (파일 경로, 플래그, ref 등) 는 그대로 유지."""
+    assert _mask_auth_in_arg("--depth") == "--depth"
+    assert _mask_auth_in_arg("origin") == "origin"
+    assert _mask_auth_in_arg("refs/pull/9/head") == "refs/pull/9/head"
+    # 일반 HTTPS URL (credentials 없음) 도 그대로
+    assert (
+        _mask_auth_in_arg("https://github.com/owner/repo.git")
+        == "https://github.com/owner/repo.git"
+    )
+
+
+def test_mask_auth_in_arg_handles_http_not_just_https() -> None:
+    """http:// 스킴도 마스킹 — 내부 테스트·dev 환경에서 발생 가능."""
+    masked = _mask_auth_in_arg("http://user:pw@localhost:8080/x.git")
+    assert "user" not in masked and "pw" not in masked
+    assert "localhost:8080/x.git" in masked
+
+
+def test_checkout_does_not_log_installation_token_in_debug(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """DEBUG 로그에 설치 토큰이 평문으로 남지 않는다.
+
+    회귀 방지 (codex PR #21 review #5 [Critical]): 이전 `_run` 은 `cmd[1:]` 전체를
+    DEBUG 로 기록했는데 그 중에는 `_inject_token` 이 만든
+    `https://x-access-token:<TOKEN>@...` 형태 인증 URL 이 포함. 로그 파일이나 외부
+    로그 수집기로 토큰이 유출되는 보안 회귀. `_mask_auth_in_arg` 가 모든 git 명령
+    인자를 통과시켜 credentials 구간만 치환해야 한다.
+    """
+    calls: list[list[str]] = []
+
+    def fake_run(cmd: list[str], **_kwargs: Any) -> subprocess.CompletedProcess[str]:
+        calls.append(cmd)
+        return subprocess.CompletedProcess(cmd, returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    fetcher = GitRepoFetcher(cache_dir=tmp_path)
+
+    with caplog.at_level(logging.DEBUG):
+        fetcher.checkout(_make_pr(), installation_token="ghs_SECRETTOKEN123")
+
+    # 실제 subprocess 호출에는 토큰이 들어있어야 하지만 (git 이 인증 써야 하니까)
+    real_token_in_cmds = any(
+        "ghs_SECRETTOKEN123" in " ".join(c) for c in calls
+    )
+    assert real_token_in_cmds, (
+        "subprocess 호출의 실제 인자에는 토큰이 들어 있어야 한다 — 마스킹은 로그에만 적용"
+    )
+
+    # 하지만 DEBUG 로그 어디에도 토큰이 평문으로 남아있으면 안 됨
+    all_log_text = "\n".join(r.getMessage() for r in caplog.records)
+    assert "ghs_SECRETTOKEN123" not in all_log_text, (
+        "DEBUG 로그에 설치 토큰이 평문으로 남음 — 로그 수집기로 자격 증명 유출 가능"
+    )
+    # 마스킹 패턴이 실제로 찍혀야 — 빈 로그만 나온 게 아니라는 검증
+    assert "***:***@" in all_log_text, (
+        "마스킹 패턴이 로그에 보여야 — 아예 URL 인자를 안 찍었으면 디버깅 가치 상실"
+    )
