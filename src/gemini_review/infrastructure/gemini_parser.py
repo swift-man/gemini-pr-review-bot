@@ -58,7 +58,14 @@ def parse_review(
     """
     payload = _extract_json(raw)
     if payload is None:
-        logger.warning("gemini output did not contain JSON; falling back to plain text")
+        # 운영 진단을 위해 raw 첫 500 자를 로그에 노출. 빈 stdout 이라면 엔진의
+        # 빈-출력 가드 (fallback chain) 가 먼저 잡았어야 — 여기까지 빈 raw 가 도달하면
+        # 그 가드가 빠진 회귀.
+        logger.warning(
+            "gemini output did not contain JSON; falling back to plain text. "
+            "raw preview (first 500 chars): %r",
+            raw[:500],
+        )
         return ReviewResult(
             summary=raw.strip()[:4000] or "Gemini 응답을 파싱하지 못했습니다.",
             event=ReviewEvent.COMMENT,
