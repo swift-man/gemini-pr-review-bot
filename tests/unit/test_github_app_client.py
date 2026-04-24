@@ -1360,3 +1360,45 @@ def test_list_self_review_comments_paginates_until_short_page(
 
     assert seen_pages == [1, 2], "100건 첫 페이지 → 2페이지 추가 fetch, 50건 → 종료"
     assert len(out) == 150, "두 페이지 합쳐 150건"
+
+
+def test_list_self_review_comments_uses_newest_first_sort(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`/pulls/{n}/comments` 호출 URL 에 `sort=created&direction=desc` 가 포함돼야 한다.
+
+    회귀 방지 (codex PR #25 review #2): GitHub 기본 정렬은 `created` ASC (오래된 순).
+    그대로 두면 1000+ 코멘트가 쌓인 장기 PR 의 최신 코멘트가 10-page cap 밖으로 밀려나
+    dedup 무력화 — Layer D 의 주된 dedup 대상인 직전 push 코멘트도 못 잡는 회귀.
+
+    `direction=desc` 보장이 깨지면 cap 안에서 최신 코멘트가 누락될 수 있으므로 URL 자체에
+    파라미터가 반드시 들어가야 한다는 invariant 를 lock.
+    """
+    OUR_APP_ID = 1234
+    captured_urls: list[str] = []
+
+    def fake_urlopen(
+        req: urllib.request.Request,
+        *,
+        timeout: float | None = None,
+        context: ssl.SSLContext | None = None,
+    ) -> _FakeResponse:
+        if "access_tokens" in req.full_url:
+            return _FakeResponse(b'{"token": "tkn", "expires_at": ""}')
+        captured_urls.append(req.full_url)
+        return _FakeResponse(b"[]")
+
+    monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+    monkeypatch.setattr(jwt, "encode", lambda *a, **k: "fake.jwt")
+
+    client = GitHubAppClient(app_id=OUR_APP_ID, private_key_pem="-")
+    client.list_self_review_comments(_sample_pr())
+
+    assert len(captured_urls) >= 1, "코멘트 endpoint 가 호출돼야"
+    url = captured_urls[0]
+    assert "sort=created" in url, (
+        f"sort=created 가 빠지면 GitHub 기본 ASC 정렬로 cap 밖 누락. URL: {url}"
+    )
+    assert "direction=desc" in url, (
+        f"direction=desc 가 빠지면 최신 코멘트 우선 보장 깨짐. URL: {url}"
+    )

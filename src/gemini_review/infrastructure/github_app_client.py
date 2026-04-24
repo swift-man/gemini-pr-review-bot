@@ -415,16 +415,24 @@ class GitHubAppClient:
         드롭. `original_line` 으로 fallback 하면 유저가 의도적으로 코드를 옮긴 경우
         가짜 dedup 발동 — 보수적으로 제외.
 
-        ### 페이지네이션
+        ### 페이지네이션 — 최신순 + 1000 cap (codex PR #25 review #2)
 
-        `per_page=100` 으로 받고 100 미만이면 마지막. `_fetch_files_for_pr` 와 동일
-        패턴. 안전장치로 10 페이지 (1000 코멘트) 에서 끊고 WARN — 그 이상이면 운영
-        이상 신호.
+        GitHub `/pulls/{n}/comments` 의 기본 정렬은 `created` ASC (오래된 순). 그대로
+        `_fetch_files_for_pr` 패턴으로 100 × 10 페이지 cap 을 적용하면 1000 코멘트가
+        쌓인 장기 PR 의 **최신** 코멘트가 cap 밖으로 밀려나 dedup history 에서 누락 →
+        직전 push 의 finding 도 못 잡는 회귀.
+
+        해결: `sort=created&direction=desc` 로 최신부터 페이지네이션. cap 안에서도 가장
+        최근 1000 코멘트를 우선 보장. dedup 의 주된 비교 대상은 직전 push 들의 코멘트
+        이므로 최신 1000 만으로 실용 충족 (그 이상 오래된 동일 finding 은 이미 모델 본문
+        도 표현이 바뀌어 정확 매칭 확률이 낮음).
+
+        cap 도달 시 WARN — 그 이상이면 운영 이상 신호 (또는 매우 활발한 장기 PR).
         """
         token = self.get_installation_token(pr.installation_id)
         comments_url = (
             f"{self._api_base}/repos/{pr.repo.full_name}/pulls/{pr.number}/comments"
-            f"?per_page=100"
+            f"?per_page=100&sort=created&direction=desc"
         )
         results: list[PostedReviewComment] = []
         page = 1
