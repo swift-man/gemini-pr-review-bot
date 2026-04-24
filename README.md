@@ -34,18 +34,20 @@ GitHub PR event
 
 ```
 src/gemini_review/
-├── interfaces/       # Protocol: GitHubClient, ReviewEngine, RepoFetcher, FileCollector
+├── interfaces/       # Protocol: GitHubClient, ReviewEngine, RepoFetcher, FileCollector,
+│                     #            FindingVerifier (출처 기반 환각 후처리 검증)
 ├── domain/           # PullRequest, ReviewResult, Finding, FileDump (frozen dataclass)
 ├── application/
-│   ├── review_pr_use_case.py   # 오케스트레이션
+│   ├── review_pr_use_case.py   # 오케스트레이션 (verify 단계 포함)
 │   └── webhook_handler.py      # HMAC 검증 + 직렬화 큐 워커
 ├── infrastructure/
-│   ├── github_app_client.py    # JWT → installation token → REST
-│   ├── git_repo_fetcher.py     # clone/fetch/checkout
-│   ├── file_dump_collector.py  # 필터 + 우선순위 + 토큰 예산
-│   ├── gemini_prompt.py        # 한국어 시스템 규칙 + 파일 직렬화
-│   ├── gemini_parser.py        # JSON 추출 (코드펜스 스트립) + fallback
-│   └── gemini_cli_engine.py    # subprocess(gemini -p) 호출 + OAuth 선점검
+│   ├── github_app_client.py                # JWT → installation token → REST
+│   ├── git_repo_fetcher.py                 # clone/fetch/checkout
+│   ├── file_dump_collector.py              # 필터 + 우선순위 + 토큰 예산
+│   ├── gemini_prompt.py                    # 한국어 시스템 규칙 + 파일 직렬화
+│   ├── gemini_parser.py                    # JSON 추출 (코드펜스 스트립) + fallback
+│   ├── gemini_cli_engine.py                # subprocess(gemini -p) 호출 + OAuth 선점검
+│   └── source_grounded_finding_verifier.py # 환각 phantom-quote 후처리 강등 (출처 grounding)
 ├── config.py         # pydantic-settings
 └── main.py           # FastAPI 조립 (DI)
 ```
