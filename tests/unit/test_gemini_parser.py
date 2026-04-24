@@ -62,6 +62,35 @@ def test_parse_fallbacks_to_plain_text_when_no_json() -> None:
     assert result.event == ReviewEvent.COMMENT
 
 
+def test_parse_fallback_warning_does_not_log_raw_content(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """JSON 추출 실패 시 raw 응답 내용 자체는 로그에 남지 않아야 한다.
+
+    회귀 방지 (codex PR #24 review #1, 보안): raw 응답에는 모델 입력으로 들어간 PR 전체
+    코드베이스의 일부가 echo 될 수 있다. 시크릿 (.env, config) 도 이 경로로 외부 로그
+    수집기에 유출 가능. 진단을 위해 길이·비어있음 여부만 기록하고 raw 본문은 로그에
+    절대 남기지 않는다.
+    """
+    secret_marker = "MY_SECRET_TOKEN_DO_NOT_LEAK"
+    raw = f"평문 응답 with hidden {secret_marker} embedded"
+
+    with caplog.at_level(logging.WARNING):
+        result = parse_review(raw)
+
+    # 결과 자체에는 raw 가 들어감 (요약 fallback) — 그건 GitHub 게시 정책의 책임 영역
+    assert secret_marker in result.summary
+    # 하지만 WARN 로그 어디에도 raw 본문이 새면 안 됨
+    log_text = " | ".join(r.getMessage() for r in caplog.records)
+    assert secret_marker not in log_text, (
+        "raw 응답이 WARN 로그에 노출됨 — 시크릿/코드 유출 경로. "
+        "길이·비어있음 여부만 로그하도록 회귀."
+    )
+    # 진단 메타는 노출돼야 — 길이와 non-empty 표기
+    assert "raw_length=" in log_text
+    assert "non_empty=" in log_text
+
+
 def test_parse_drops_findings_without_valid_line() -> None:
     raw = """
     {

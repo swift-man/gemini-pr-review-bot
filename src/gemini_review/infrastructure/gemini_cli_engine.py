@@ -167,9 +167,15 @@ class GeminiCliEngine:
                             fallback,
                         )
                         continue
+                    # 진단 보강 (codex PR #24 review): 마지막 모델명과 stderr preview 를
+                    # 메시지에 포함해 운영자가 어떤 모델이 마지막에 실패했고 그 시점의
+                    # 부가 정보 (예: 토큰 한도 도달 메시지) 가 무엇이었는지 즉시 확인 가능.
+                    # stderr 는 보통 진단 정보 (모델 상태/에러) 를 담아 시크릿 위험은 낮지만
+                    # preview 길이는 200 자로 제한해 만일의 누출 표면 줄임.
+                    stderr_preview = (result.stderr or "").strip()[:200]
                     raise RuntimeError(
-                        f"gemini -p returned empty stdout on all {len(models)} model(s) — "
-                        "no review content to post"
+                        f"gemini -p returned empty stdout on all {len(models)} model(s); "
+                        f"last_model={model}, stderr_preview={stderr_preview!r}"
                     )
                 # `parse_review` 는 CLI 출력만 해석하므로 어느 모델이 이 결과를 만들었는지
                 # 모른다. 여기서 한 번에 주입해서 fallback 발동 시 운영자가 본문 푸터로

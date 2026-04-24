@@ -264,21 +264,35 @@ def test_review_raises_when_all_models_return_empty_stdout(
 ) -> None:
     """모든 모델이 빈 stdout 으로 응답하면 RuntimeError raise — 빈 리뷰 게시 차단.
 
-    회귀 방지: 이전엔 빈 stdout 도 "성공" 으로 간주해 빈 ReviewResult 가 GitHub 에
-    게시됐다. exhaustion 시점엔 더이상 게시할 콘텐츠가 없으므로 명시적으로 실패시켜
-    상위 핸들러가 "리뷰 생성 실패" 알림으로 처리할 수 있게 한다.
+    회귀 방지:
+    - 이전엔 빈 stdout 도 "성공" 으로 간주해 빈 ReviewResult 가 GitHub 에 게시됐다.
+      exhaustion 시점엔 더이상 게시할 콘텐츠가 없으므로 명시적으로 실패시켜 상위
+      핸들러가 "리뷰 생성 실패" 알림으로 처리할 수 있게 한다.
+    - 진단 보강 (codex PR #24 review #3): 메시지에 마지막 모델명 + stderr preview 가
+      들어가야 운영자가 어떤 모델이 마지막에 실패했는지 즉시 확인 가능.
     """
     def fake_run(cmd: list[str], **_kwargs: Any) -> _FakeCompleted:
-        return _FakeCompleted(0, stdout="", stderr="")
+        # 모델별로 다른 stderr 를 줘서 마지막 모델의 stderr 가 예외 메시지에 들어가는지 확인
+        model_arg = cmd[2] if len(cmd) > 2 else "?"
+        return _FakeCompleted(
+            0, stdout="", stderr=f"[{model_arg}] hit token cap"
+        )
 
     monkeypatch.setattr(subprocess, "run", fake_run)
 
-    with pytest.raises(RuntimeError, match="empty stdout on all"):
+    with pytest.raises(RuntimeError, match="empty stdout on all") as exc_info:
         GeminiCliEngine(
             binary="gemini",
             model="gemini-3.1-pro-preview",
             fallback_models=("gemini-2.5-pro",),
         ).review(_sample_pr(), FileDump(entries=(), total_chars=0))
+
+    msg = str(exc_info.value)
+    # 마지막 모델명이 메시지에 포함돼야 운영 진단 가능
+    assert "last_model=gemini-2.5-pro" in msg
+    # 마지막 모델의 stderr preview 가 포함돼야 — 빈 응답의 부가 원인 즉시 확인
+    assert "hit token cap" in msg
+    assert "gemini-2.5-pro" in msg  # stderr 의 모델명도 함께
 
 
 def test_review_does_not_fall_back_on_non_retryable_cli_failure(

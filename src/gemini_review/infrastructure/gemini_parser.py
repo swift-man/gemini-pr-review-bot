@@ -58,13 +58,17 @@ def parse_review(
     """
     payload = _extract_json(raw)
     if payload is None:
-        # 운영 진단을 위해 raw 첫 500 자를 로그에 노출. 빈 stdout 이라면 엔진의
-        # 빈-출력 가드 (fallback chain) 가 먼저 잡았어야 — 여기까지 빈 raw 가 도달하면
-        # 그 가드가 빠진 회귀.
+        # **보안 주의** (codex PR #24 review): raw 응답에는 모델 입력으로 들어간 PR
+        # 전체 코드베이스의 일부가 echo 될 수 있다 (예: 시크릿이 포함된 .env, 인증 정보가
+        # 박힌 config). raw preview 를 직접 로그에 남기면 외부 로그 수집기로 코드/시크릿
+        # 유출 경로가 됨. 진단 정보는 길이·비어있음 여부만으로도 충분 — 빈 stdout 이라면
+        # 엔진의 빈-출력 가드 (fallback chain) 가 먼저 잡았어야 하므로, 여기까지 도달한
+        # raw 의 길이가 0 이면 그 가드가 빠진 회귀.
         logger.warning(
-            "gemini output did not contain JSON; falling back to plain text. "
-            "raw preview (first 500 chars): %r",
-            raw[:500],
+            "gemini output did not contain JSON; falling back to plain text "
+            "(raw_length=%d, non_empty=%s). raw content NOT logged for security.",
+            len(raw),
+            bool(raw.strip()),
         )
         return ReviewResult(
             summary=raw.strip()[:4000] or "Gemini 응답을 파싱하지 못했습니다.",
