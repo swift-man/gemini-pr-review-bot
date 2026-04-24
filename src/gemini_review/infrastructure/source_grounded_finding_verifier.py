@@ -74,9 +74,14 @@ class SourceGroundedFindingVerifier:
         (codex PR #23 review #2). 캐시는 호출 단위라 다음 verify() 호출 (다음 PR) 에는
         상태가 새로 시작됨 — 메모리 누수 위험 없음.
         """
-        # 호출 단위 파일 라인 캐시. key=path (relative), value=lines list 또는 None (읽기 실패).
-        # `None` 도 명시적으로 캐싱해 같은 누락 파일을 여러 번 읽으려 시도하지 않음.
-        line_cache: dict[str, list[str] | None] = {}
+        # 호출 단위 파일 라인 캐시. key=path (relative).
+        # value=(lines, status):
+        #   - 정상: (lines, "ok")
+        #   - 실패: (None, "missing"|"permission_denied"|"io_error")
+        # 실패 status 까지 캐싱 — 같은 파일에 여러 finding 이 있을 때 같은 read_text() 호출
+        # 을 반복하지 않도록 (codex PR #23 review #2). 동시에 실패 원인을 두 번째 finding 의
+        # 진단 메시지에도 동일 status 로 노출해 운영 일관성 유지 (codex PR #23 review #7).
+        line_cache: dict[str, tuple[list[str] | None, str]] = {}
         new_findings = tuple(
             self._maybe_downgrade(f, repo_root, line_cache) for f in result.findings
         )
@@ -87,7 +92,7 @@ class SourceGroundedFindingVerifier:
         self,
         f: Finding,
         repo_root: Path,
-        line_cache: dict[str, list[str] | None],
+        line_cache: dict[str, tuple[list[str] | None, str]],
     ) -> Finding:
         head = _SEVERITY_PREFIX_HEAD.match(f.body)
         if head is None:
@@ -185,7 +190,7 @@ def _read_source_line(
     repo_root: Path,
     path: str,
     line: int,
-    line_cache: dict[str, list[str] | None],
+    line_cache: dict[str, tuple[list[str] | None, str]],
 ) -> tuple[str | None, str]:
     """`repo_root / path` 의 1-based line 번호 라인을 반환.
 
@@ -193,15 +198,25 @@ def _read_source_line(
         (line_text, status) 튜플:
         - 정상: ("실제 라인 텍스트", "ok")
         - 라인 못 읽음: (None, status) — status 는 호출자가 진단 메시지에 사용
-            - "missing": 파일이 디스크에 없음 (삭제된 파일 등)
+            - "missing": 파일이 디스크에 없음 (삭제된 파일 등 → FileNotFoundError)
+            - "permission_denied": 읽기 권한 없음 (PermissionError) — 운영자가 chmod
+              조치 필요한 케이스. "missing" 과 섞여 보고되면 진단이 헷갈림 (codex PR #23
+              review #7).
             - "out_of_range": 파일은 있으나 라인 번호 범위 밖
             - "traversal": path 가 repo_root 밖을 가리킴 (../ 등)
-            - "io_error": 그 외 IO 오류 (권한, 바이너리 등)
+            - "io_error": 그 외 IO 오류 (디렉터리·디바이스 등 OSError 잡합)
 
     같은 verify() 호출 안에서 파일별 라인 리스트를 캐싱해 같은 파일을 여러 번 읽지 않음
-    (codex PR #23 review #2). path traversal 방어 (gemini PR #23 review): `path` 는 모델
-    출력에서 온 신뢰 불가 입력이므로 `..` 등으로 repo_root 밖을 가리킬 수 있다. resolve()
-    후 repo_root 의 자식인지 확인 — 아니면 즉시 traversal 로 거부 (캐시도 안 함).
+    (codex PR #23 review #2). 실패 status 도 캐싱 — 같은 누락/권한 거부 파일에 여러
+    finding 이 달려도 read_text() 시도는 한 번 (codex PR #23 review #7).
+
+    path traversal 방어 (gemini PR #23 review): `path` 는 모델 출력에서 온 신뢰 불가
+    입력이므로 `..` 등으로 repo_root 밖을 가리킬 수 있다. resolve() 후 repo_root 의
+    자식인지 확인 — 아니면 즉시 traversal 로 거부 (캐시도 안 함).
+
+    텍스트 디코딩은 `errors="replace"` 라 UnicodeDecodeError 가 나지 않는다 (대체 문자로
+    바뀜). 진짜 바이너리는 매치가 자연스럽게 실패 → phantom 처럼 강등됨 — 영향 가능성은
+    낮지만 의도된 동작.
     """
     # Path traversal 방어 — `..` 등 repo_root 를 벗어나는 경로는 거부.
     # `resolve()` 는 symlink 도 따라가 최종 경로를 만든다. is_relative_to 로 봉쇄 검증.
@@ -218,16 +233,24 @@ def _read_source_line(
         return None, "traversal"
 
     if path in line_cache:
-        lines = line_cache[path]
+        lines, cached_status = line_cache[path]
     else:
         try:
             text = candidate.read_text(encoding="utf-8", errors="replace")
-            lines = text.splitlines()
+            lines, cached_status = text.splitlines(), "ok"
+        except FileNotFoundError:
+            lines, cached_status = None, "missing"
+        except PermissionError:
+            lines, cached_status = None, "permission_denied"
         except OSError:
-            lines = None
-        line_cache[path] = lines
+            # IsADirectoryError, NotADirectoryError, OSError(EIO) 등 잡합.
+            # FileNotFoundError / PermissionError 도 OSError 의 하위 클래스라 위에서 먼저
+            # 잡아야 한다. 순서가 바뀌면 모든 IO 실패가 "io_error" 로 흡수돼 진단 가치가
+            # 떨어진다.
+            lines, cached_status = None, "io_error"
+        line_cache[path] = (lines, cached_status)
     if lines is None:
-        return None, "missing"
+        return None, cached_status
     if line <= 0 or line > len(lines):
         return None, "out_of_range"
     return lines[line - 1], "ok"

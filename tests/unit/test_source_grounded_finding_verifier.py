@@ -179,6 +179,52 @@ def test_verify_downgrades_when_line_out_of_range_and_assertion_hint_present(
     assert "out_of_range" in out.findings[0].body
 
 
+# --- Read-error 분리: missing vs permission_denied (codex PR #23 review #7) -
+
+
+def test_verify_distinguishes_permission_denied_from_missing(
+    tmp_path: Path,
+) -> None:
+    """읽기 권한 거부는 `permission_denied` 로 노출 — `missing` 과 진단상 구분돼야 한다.
+
+    회귀 방지 (codex PR #23 review #7): 이전엔 `FileNotFoundError` 와 `PermissionError`
+    를 모두 `OSError` 한 갈래에서 잡아 status 를 `missing` 으로 보고했다. 운영자가
+    "체크아웃 누락" 과 "권한 문제 (chmod 필요)" 를 즉시 구분할 수 없어 진단이 헷갈렸다.
+    이제 PermissionError 는 별도 status 로 분리.
+    """
+    import pathlib
+    import pytest
+
+    target = tmp_path / "perm.py"
+    target.write_text("real_line = 1\n", encoding="utf-8")
+    finding = Finding(
+        path="perm.py", line=1, body="[Critical] 공백 오타 `\" phantom\"`"
+    )
+
+    original_read_text = pathlib.Path.read_text
+
+    def deny(self: pathlib.Path, *args: object, **kwargs: object) -> str:
+        if self.name == "perm.py":
+            raise PermissionError(13, "Permission denied", str(self))
+        return original_read_text(self, *args, **kwargs)  # type: ignore[arg-type]
+
+    mp = pytest.MonkeyPatch()
+    try:
+        mp.setattr(pathlib.Path, "read_text", deny)
+        out = SourceGroundedFindingVerifier().verify(_result(finding), tmp_path)
+    finally:
+        mp.undo()
+
+    assert out.findings[0].body.startswith("[Suggestion]"), "권한 거부도 검증 불가 = 강등"
+    body = out.findings[0].body
+    assert "permission_denied" in body, (
+        f"PermissionError 는 'permission_denied' status 로 노출돼야 함. body={body!r}"
+    )
+    assert "missing" not in body, (
+        "권한 거부를 'missing' 으로 보고하면 운영 진단 혼란 — 분리돼야 함"
+    )
+
+
 # --- Path traversal 방어 (gemini PR #23 review) ----------------------------
 
 
