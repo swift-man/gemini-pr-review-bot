@@ -187,3 +187,140 @@ def test_verify_keeps_request_changes_when_other_blocking_survives(tmp_path: Pat
     assert out.findings[0].body.startswith("[Suggestion]")  # phantom 강등
     assert out.findings[1].body.startswith("[Critical]")  # 정당한 finding 유지
     assert out.event == ReviewEvent.REQUEST_CHANGES, "blocking 살아있으면 약화 안 함"
+
+
+# --- Lenient any-match policy (codex PR #23 review #1 회귀 방지) -----------
+
+
+def test_verify_lenient_keeps_finding_when_typo_quote_matches_even_if_fix_does_not(
+    tmp_path: Path,
+) -> None:
+    """정상 typo finding 은 `현재값` `수정안` 두 텍스트를 함께 인용하는 패턴이 흔함.
+
+    회귀 방지 (codex PR #23 review #1): 옛 strict 정책 ("any quote NOT in line → 강등")
+    은 수정안이 라인에 없다는 이유로 정당한 typo finding 까지 강등시킴. 새 lenient
+    정책은 인용 중 **하나라도** 라인에 있으면 통과 — 현재값이 라인에 있으니 보존.
+
+    실제 typo `usrname` 이 라인에 있고, 모델이 "`usrname` 을 `username` 으로 수정"
+    이라고 적으면: `username` 은 라인에 없지만 `usrname` 은 있음 → 통과해야 한다.
+    """
+    _write(tmp_path, "x.py", "\n" * 4 + 'def hello(usrname):\n')
+    finding = Finding(
+        path="x.py",
+        line=5,
+        body="[Critical] 변수명에 오타가 있습니다. `usrname` 을 `username` 으로 수정하세요.",
+    )
+
+    out = SourceGroundedFindingVerifier().verify(_result(finding), tmp_path)
+
+    assert out.findings[0].body.startswith("[Critical]"), (
+        "현재값 `usrname` 이 라인에 있으므로 정당한 finding 으로 통과해야 — lenient any-match 정책"
+    )
+    assert "자동 강등" not in out.findings[0].body
+
+
+def test_verify_lenient_downgrades_when_no_quote_matches_line(tmp_path: Path) -> None:
+    """lenient 정책 검증의 negative side: 인용 모두 라인에 없으면 강등 발동.
+
+    회귀 방지: lenient 가 너무 관대해져서 phantom case 도 통과시키면 PR #23 의 본 목적을
+    잃는다. 모든 인용이 라인에 없을 때만 강등 발동해야 한다.
+    """
+    _write(tmp_path, "x.py", "\n" * 4 + 'def hello(name):\n')
+    finding = Finding(
+        path="x.py",
+        line=5,
+        body="[Critical] 공백 오타 — `\" name\"` 이 `\"name\"` 으로 돼 있어야 합니다.",
+    )
+
+    out = SourceGroundedFindingVerifier().verify(_result(finding), tmp_path)
+
+    assert out.findings[0].body.startswith("[Suggestion]"), (
+        "인용 둘 (`\" name\"`, `\"name\"`) 모두 라인에 없으면 phantom → 강등"
+    )
+
+
+# --- 파일별 라인 캐시 (codex PR #23 review #2 회귀 방지) -------------------
+
+
+def test_verify_uses_per_call_file_cache_to_avoid_repeated_io(
+    tmp_path: Path,
+) -> None:
+    """같은 파일을 가리키는 finding 여러 개에 대해 디스크 read 가 1회로 줄어야 한다.
+
+    회귀 방지 (codex PR #23 review #2): 캐시 없이 매 finding 마다 `read_text()` 호출하면
+    대형 PR 의 같은 파일에 finding 이 N 개 있을 때 N 번 디스크 read — 큰 PR 일수록 비례
+    낭비. 호출 단위 캐시로 N → 1 로 줄어야.
+    """
+    import pathlib
+
+    import pytest
+
+    _write(tmp_path, "x.py", "\n" * 9 + 'def f(x):\n')
+    findings = tuple(
+        Finding(
+            path="x.py",
+            line=10,
+            body=f"[Major] 공백 오타 #{i} `\" not_real\"`",
+        )
+        for i in range(5)
+    )
+
+    read_count = 0
+    original = pathlib.Path.read_text
+
+    def counting_read(self: pathlib.Path, *args: object, **kwargs: object) -> str:
+        nonlocal read_count
+        read_count += 1
+        return original(self, *args, **kwargs)  # type: ignore[arg-type]
+
+    mp = pytest.MonkeyPatch()
+    try:
+        mp.setattr(pathlib.Path, "read_text", counting_read)
+        SourceGroundedFindingVerifier().verify(_result(*findings), tmp_path)
+    finally:
+        mp.undo()
+
+    assert read_count == 1, (
+        f"같은 파일 5 개 finding → read_text 1번이어야 (캐시 작동). 실제 {read_count}번"
+    )
+
+
+def test_verify_caches_missing_files_to_avoid_repeated_failed_io(
+    tmp_path: Path,
+) -> None:
+    """없는 파일을 가리키는 finding 여러 개도 read 시도가 1번이어야 한다.
+
+    회귀 방지: 캐시가 None (읽기 실패) 도 명시적으로 저장해야 동일 누락 파일을 여러 번
+    open() 시도하지 않는다. file system stat call 도 비용.
+    """
+    import pathlib
+
+    import pytest
+
+    findings = tuple(
+        Finding(
+            path="missing.py",
+            line=1,
+            body=f"[Major] 공백 오타 #{i} `\" not_real\"`",
+        )
+        for i in range(3)
+    )
+
+    read_count = 0
+    original = pathlib.Path.read_text
+
+    def counting_read(self: pathlib.Path, *args: object, **kwargs: object) -> str:
+        nonlocal read_count
+        read_count += 1
+        return original(self, *args, **kwargs)  # type: ignore[arg-type]
+
+    mp = pytest.MonkeyPatch()
+    try:
+        mp.setattr(pathlib.Path, "read_text", counting_read)
+        SourceGroundedFindingVerifier().verify(_result(*findings), tmp_path)
+    finally:
+        mp.undo()
+
+    assert read_count == 1, (
+        f"누락 파일 3 finding → read_text 1번 시도여야 (None 도 캐싱). 실제 {read_count}번"
+    )

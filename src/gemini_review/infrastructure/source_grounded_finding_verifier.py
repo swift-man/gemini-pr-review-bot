@@ -43,22 +43,48 @@ class SourceGroundedFindingVerifier:
     def verify(self, result: ReviewResult, repo_root: Path) -> ReviewResult:
         """phantom quote 단언을 가진 [Critical]/[Major] finding 을 [Suggestion] 으로 강등.
 
-        검증 조건 (모두 만족):
+        ### 강등 발동 조건 (모두 만족)
+
         1. body 가 [Critical] 또는 [Major] 시작
         2. body 에 assertion hint 키워드 ("공백", "띄어쓰기", "오타", ...) 포함 — 단언으로 추정
-        3. body 에 backtick 인용 substring 존재
-        4. 인용 substring 중 하나라도 path:line 의 raw 라인에 없음
+        3. body 에 backtick 인용 substring 이 1개 이상
+        4. **인용 substring 중 단 하나도** path:line 의 raw 라인에 없음 (lenient: any-match → keep)
 
-        모두 만족하면 환각 가능성 높음 → 강등 + WARN. 강등으로 blocking 분포가 바뀌면
-        `_normalize_event` 가 event 를 재정합 (REQUEST_CHANGES 약화 등).
+        ### 왜 "any-match → keep" lenient 정책인가
+
+        codex PR #23 review #1 — 정상적인 typo/공백 finding 은 `현재 코드 → 수정안` 형태로
+        두 텍스트를 함께 인용함. 예: "`usrname` 을 `username` 으로 수정". 옛 strict 정책
+        ("any quote not in line → downgrade") 은 수정안 `username` 이 라인에 없다는 이유로
+        정당한 finding 까지 강등시킴. 새 lenient 정책은 인용 중 **하나라도** 라인에 있으면
+        통과 — `usrname` 이 라인에 있으니 정당한 finding 그대로 유지.
+
+        Phantom case (사용자 신고): 모델이 인용한 텍스트는 `" @scope"` 단 하나, 라인에는
+        `"@scope"` (공백 0). 어떤 인용도 라인에 매치 안 됨 → 강등 발동.
+
+        강등으로 blocking 분포가 바뀌면 `_normalize_event` 가 event 를 재정합.
+
+        ### I/O 비용
+
+        같은 repo 안에서 여러 finding 이 같은 파일을 가리키는 경우가 흔함 (대형 PR).
+        verify() 호출 1회 안에서 파일별 읽은 라인 캐시를 둬 같은 파일을 여러 번 읽지 않음
+        (codex PR #23 review #2). 캐시는 호출 단위라 다음 verify() 호출 (다음 PR) 에는
+        상태가 새로 시작됨 — 메모리 누수 위험 없음.
         """
+        # 호출 단위 파일 라인 캐시. key=path (relative), value=lines list 또는 None (읽기 실패).
+        # `None` 도 명시적으로 캐싱해 같은 누락 파일을 여러 번 읽으려 시도하지 않음.
+        line_cache: dict[str, list[str] | None] = {}
         new_findings = tuple(
-            self._maybe_downgrade(f, repo_root) for f in result.findings
+            self._maybe_downgrade(f, repo_root, line_cache) for f in result.findings
         )
         new_event = _normalize_event(result.event, new_findings)
         return dataclasses.replace(result, findings=new_findings, event=new_event)
 
-    def _maybe_downgrade(self, f: Finding, repo_root: Path) -> Finding:
+    def _maybe_downgrade(
+        self,
+        f: Finding,
+        repo_root: Path,
+        line_cache: dict[str, list[str] | None],
+    ) -> Finding:
         head = _SEVERITY_PREFIX_HEAD.match(f.body)
         if head is None:
             return f
@@ -73,44 +99,59 @@ class SourceGroundedFindingVerifier:
         quotes = _BACKTICK_QUOTE.findall(f.body)
         if not quotes:
             return f
-        line = _read_source_line(repo_root, f.path, f.line)
+        line = _read_source_line(repo_root, f.path, f.line, line_cache)
         if line is None:
             return f  # 파일 없거나 라인 범위 밖 — 검증 불가, 통과
-        # 인용 substring 중 하나라도 라인에 없으면 phantom quote 의심.
-        # 빈 인용 (`` `` `` ``) 은 substring "" 가 항상 매치하므로 자연스럽게 통과.
-        missing = [q for q in quotes if q not in line]
-        if not missing:
+        # Lenient: 인용 중 하나라도 라인에 매치하면 정당한 finding 으로 간주 → 통과.
+        # 모든 인용이 라인에 없을 때만 phantom quote 환각으로 강등.
+        # 정상 typo/공백 finding 은 `현재값` 과 `수정안` 둘 다 인용하는 패턴이 흔함 —
+        # 현재값은 라인에 있으므로 자동 통과 (codex PR #23 review #1 lenient 정책).
+        if any(q in line for q in quotes):
             return f
+        # 모두 라인에 없음 — 어떤 인용을 진단 메시지에 노출할지 선택. 첫 번째로 충분.
+        first_missing = quotes[0]
         logger.warning(
-            "downgrading severity %s -> Suggestion: phantom quote %r not in %s:%d "
-            "(assertion-hint keyword triggered verification)",
+            "downgrading severity %s -> Suggestion: no backtick-quoted substring "
+            "found in %s:%d (first missing: %r). assertion-hint keyword triggered "
+            "verification.",
             severity,
-            missing[0],
             f.path,
             f.line,
+            first_missing,
         )
         return Finding(
             path=f.path,
             line=f.line,
             body=(
-                f"[Suggestion] (자동 강등: 인용 텍스트 `{missing[0]}` 가 "
+                f"[Suggestion] (자동 강등: 인용 텍스트 `{first_missing}` 등이 "
                 f"{f.path}:{f.line} 의 실제 라인에 없음 — phantom quote 환각 가능성, "
                 f"원래 [{severity}]) {rest}"
             ),
         )
 
 
-def _read_source_line(repo_root: Path, path: str, line: int) -> str | None:
+def _read_source_line(
+    repo_root: Path,
+    path: str,
+    line: int,
+    line_cache: dict[str, list[str] | None],
+) -> str | None:
     """`repo_root / path` 의 1-based line 번호 라인을 반환. 없으면 None.
 
-    실패 케이스 (파일 없음·바이너리·라인 범위 초과) 는 전부 None 반환 → 검증 생략.
-    검증 도중 silent failure 가 finding 게시를 막으면 안 되므로 보수적으로 통과시킨다.
+    같은 verify() 호출 안에서 파일별 라인 리스트를 캐싱해 같은 파일을 여러 번 읽지 않음
+    (codex PR #23 review #2 — 대형 PR 의 파일별 finding 다수 시 I/O 절감).
+    실패 케이스 (파일 없음·바이너리·라인 범위 초과) 는 None 반환 → 검증 생략.
+    silent failure 가 finding 게시를 막으면 안 되므로 보수적으로 통과시킨다.
     """
-    try:
-        text = (repo_root / path).read_text(encoding="utf-8", errors="replace")
-    except OSError:
-        return None
-    lines = text.splitlines()
-    if line <= 0 or line > len(lines):
+    if path in line_cache:
+        lines = line_cache[path]
+    else:
+        try:
+            text = (repo_root / path).read_text(encoding="utf-8", errors="replace")
+            lines = text.splitlines()
+        except OSError:
+            lines = None
+        line_cache[path] = lines
+    if lines is None or line <= 0 or line > len(lines):
         return None
     return lines[line - 1]
