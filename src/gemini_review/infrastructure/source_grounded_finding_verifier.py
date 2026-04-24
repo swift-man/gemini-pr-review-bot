@@ -39,6 +39,24 @@ _BACKTICK_QUOTE = re.compile(r"`([^`]+)`")
 _SEVERITY_PREFIX_HEAD = re.compile(r"^\[(Critical|Major|Minor|Suggestion)\] (.*)", re.DOTALL)
 _BLOCKING_SEVERITIES = frozenset({"Critical", "Major"})
 
+# 본문이 "현재값 → 수정안" 형태의 정상 typo/공백 finding 임을 시사하는 표지.
+# 이 표지가 있으면 lenient 매칭 (인용 중 하나라도 라인에 있으면 통과 — 현재값만 검증);
+# 없으면 strict 매칭 (모든 인용이 라인에 있어야 통과 — phantom + real 혼합 차단).
+# 영문 패턴은 소문자로 보관, 매칭 시 body 도 소문자화 (codex PR #23 review #4 정책 조정).
+_FIX_PATTERN_HINTS = (
+    "→",  # 한국어 화살표
+    "->",  # ASCII 화살표
+    "로 변경",
+    "로 수정",
+    "으로 변경",
+    "으로 수정",
+    "대신",  # "X 대신 Y 사용"
+    "should be",
+    "instead of",
+    "rather than",
+    "replace",
+)
+
 
 class SourceGroundedFindingVerifier:
     """체크아웃된 repo 디렉터리에서 라인을 읽어 finding 의 quote 단언을 검증."""
@@ -126,22 +144,39 @@ class SourceGroundedFindingVerifier:
                     f"원래 [{severity}]) {rest}"
                 ),
             )
-        # Lenient: 인용 중 하나라도 라인에 매치하면 정당한 finding 으로 간주 → 통과.
-        # 모든 인용이 라인에 없을 때만 phantom quote 환각으로 강등.
-        # 정상 typo/공백 finding 은 `현재값` 과 `수정안` 둘 다 인용하는 패턴이 흔함 —
-        # 현재값은 라인에 있으므로 자동 통과 (codex PR #23 review #1 lenient 정책).
-        if any(q in line for q in quotes):
-            return f
-        # 모두 라인에 없음 — 어떤 인용을 진단 메시지에 노출할지 선택. 첫 번째로 충분.
-        first_missing = quotes[0]
+        # 매칭 정책 (codex PR #23 review #1 → #4 의 추가 조정):
+        #
+        # - **fix-pattern lenient**: body 가 "현재값 → 수정안" 형태의 표지 (`→`, `로 변경`,
+        #   `should be` 등) 를 포함하면 정상 typo finding 으로 보고 lenient 매칭 — 인용 중
+        #   하나라도 라인에 있으면 통과. 현재값만 검증되면 충분 (수정안은 라인에 없는 게 정상).
+        # - **strict default**: 그 외엔 모든 인용이 라인에 있어야 통과. phantom quote 가
+        #   real quote 와 함께 한 본문에 들어가 있는 경우 ("phantom 공백 `\" usrname\"` 을
+        #   `usrname` 에서 제거" 같은) 를 strict 로 잡는다. 전부 매칭이 아니면 phantom 의심.
+        #
+        # 이 정책은 codex review #4 의 우려 — lenient any-match 가 phantom + real 혼합을
+        # 통과시킴 — 를 좁히면서, review #1 의 정상 typo+fix 패턴도 보호.
+        matches = [q for q in quotes if q in line]
+        if _has_fix_pattern(body_lower):
+            # fix-pattern 표지 있음 → lenient: 현재값 1개만 매치되면 통과
+            if matches:
+                return f
+        else:
+            # fix-pattern 표지 없음 → strict: 모든 인용이 라인에 있어야 통과
+            if len(matches) == len(quotes):
+                return f
+        # 매칭 실패 — phantom quote 환각으로 강등
+        first_missing = next(q for q in quotes if q not in line)
         logger.warning(
-            "downgrading severity %s -> Suggestion: no backtick-quoted substring "
-            "found in %s:%d (first missing: %r). assertion-hint keyword triggered "
-            "verification.",
+            "downgrading severity %s -> Suggestion: phantom-quote in %s:%d "
+            "(missing: %r, total quotes=%d, matched=%d, fix_pattern=%s). "
+            "assertion-hint keyword triggered verification.",
             severity,
             f.path,
             f.line,
             first_missing,
+            len(quotes),
+            len(matches),
+            _has_fix_pattern(body_lower),
         )
         return Finding(
             path=f.path,
@@ -162,6 +197,15 @@ class SourceGroundedFindingVerifier:
             f.line,
             status,
         )
+
+
+def _has_fix_pattern(body_lower: str) -> bool:
+    """body (소문자화) 에 fix-pattern 표지가 있으면 True.
+
+    표지가 있으면 "현재값 → 수정안" 형태의 정상 finding 으로 보고 lenient 매칭 적용.
+    `_FIX_PATTERN_HINTS` 에 누적된 표현 중 하나라도 등장하면 발동.
+    """
+    return any(hint in body_lower for hint in _FIX_PATTERN_HINTS)
 
 
 def _read_source_line(

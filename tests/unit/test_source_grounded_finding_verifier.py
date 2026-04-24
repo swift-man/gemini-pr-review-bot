@@ -420,3 +420,100 @@ def test_verify_caches_missing_files_to_avoid_repeated_failed_io(
     assert read_count == 1, (
         f"누락 파일 3 finding → read_text 1번 시도여야 (None 도 캐싱). 실제 {read_count}번"
     )
+
+
+# --- Strict default vs fix-pattern lenient (codex PR #23 review #4 회귀 방지) ----
+
+
+def test_verify_strict_downgrades_phantom_quote_mixed_with_real_quote_no_fix_pattern(
+    tmp_path: Path,
+) -> None:
+    """phantom quote 와 real quote 가 한 본문에 함께 있고 fix-pattern 표지가 없으면 강등.
+
+    회귀 방지 (codex PR #23 review #4): 이전 lenient 정책은 "인용 중 하나라도 매치하면
+    통과" 였음. phantom case (실관측): "현재 라인의 `usrname` 에 있는 phantom 공백
+    `\" usrname\"` 을 제거" — `usrname` 은 실제 라인에 있고 `" usrname"` 은 없음. lenient
+    는 1개 매치로 통과시켜 환각 [Critical] 이 그대로 게시되던 우회로.
+
+    새 정책 (strict default): fix-pattern 표지 (`→`, `로 변경` 등) 가 없으면 모든 인용이
+    라인에 있어야 통과. 위 phantom case 는 표지 없으므로 strict 적용 → 강등.
+    """
+    _write(tmp_path, "x.py", "\n" * 4 + "def hello(usrname):\n")
+    finding = Finding(
+        path="x.py",
+        line=5,
+        body=(
+            "[Critical] 공백 오타 — `usrname` 앞에 phantom 공백 `\" usrname\"` 이 있어 "
+            "import 가 깨집니다."
+        ),
+    )
+
+    out = SourceGroundedFindingVerifier().verify(_result(finding), tmp_path)
+
+    assert out.findings[0].body.startswith("[Suggestion]"), (
+        "fix-pattern 표지 없음 + 인용 일부 매치 → strict 정책으로 강등돼야 (phantom 의심)"
+    )
+    assert "원래 [Critical]" in out.findings[0].body
+
+
+def test_verify_lenient_keeps_finding_when_fix_pattern_korean_arrow_present(
+    tmp_path: Path,
+) -> None:
+    """`→` 같은 fix-pattern 표지가 있으면 lenient 적용 — 현재값 1개만 매치되면 통과.
+
+    회귀 방지: codex review #1 의 정상 typo+fix 패턴은 보호. fix-pattern 표지 인식이
+    빠지면 typo finding 도 strict 에 걸려 강등됨.
+    """
+    _write(tmp_path, "x.py", "\n" * 4 + "def hello(usrname):\n")
+    finding = Finding(
+        path="x.py",
+        line=5,
+        body="[Critical] 변수명 오타: `usrname` → `username`",
+    )
+
+    out = SourceGroundedFindingVerifier().verify(_result(finding), tmp_path)
+
+    assert out.findings[0].body.startswith("[Critical]"), (
+        "`→` fix-pattern 표지 있음 → lenient. `usrname` 매치 → 통과"
+    )
+
+
+def test_verify_lenient_keeps_finding_when_fix_pattern_should_be_present(
+    tmp_path: Path,
+) -> None:
+    """영문 fix-pattern (`should be`) 도 lenient 발동."""
+    _write(tmp_path, "x.py", "\n" * 4 + "def hello(usrname):\n")
+    finding = Finding(
+        path="x.py",
+        line=5,
+        body="[Critical] Typo: `usrname` should be `username`",
+    )
+
+    out = SourceGroundedFindingVerifier().verify(_result(finding), tmp_path)
+
+    assert out.findings[0].body.startswith("[Critical]"), (
+        "`should be` 표지 → lenient → `usrname` 매치 → 통과"
+    )
+
+
+def test_verify_strict_downgrades_when_no_quote_matches_even_with_fix_pattern(
+    tmp_path: Path,
+) -> None:
+    """fix-pattern 있어도 어떤 인용도 라인에 없으면 강등 — pure phantom 보장.
+
+    회귀 방지: lenient 가 너무 관대해져 fix-pattern 만 있으면 무조건 통과시키면 안 됨.
+    적어도 하나는 라인에 있어야 (현재값) lenient 통과 발동. 모두 phantom 이면 fix-pattern
+    유무와 무관하게 강등.
+    """
+    _write(tmp_path, "x.py", "\n" * 4 + "def hello(name):\n")  # `usrname` 도 없음
+    finding = Finding(
+        path="x.py",
+        line=5,
+        body="[Critical] Typo: `usrname` → `username`",  # 둘 다 라인에 없음
+    )
+
+    out = SourceGroundedFindingVerifier().verify(_result(finding), tmp_path)
+
+    assert out.findings[0].body.startswith("[Suggestion]"), (
+        "fix-pattern 있어도 모든 인용이 라인에 없으면 강등 (pure phantom)"
+    )
