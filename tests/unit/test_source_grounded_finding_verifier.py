@@ -119,19 +119,55 @@ def test_verify_skips_findings_without_backtick_quotes(tmp_path: Path) -> None:
     assert out.findings[0].body.startswith("[Critical]"), "인용 없으면 검증 불가 → 강등 안 함"
 
 
-def test_verify_skips_when_file_missing(tmp_path: Path) -> None:
-    """디스크에 파일 없으면 검증 생략 (강등 안 함) — silent failure 가 finding 게시를 막으면 안 됨."""
+def test_verify_downgrades_when_file_missing_and_assertion_hint_present(
+    tmp_path: Path,
+) -> None:
+    """디스크에 파일 없는 상태로 assertion-hint + 인용된 [Critical] 이 들어오면 강등.
+
+    회귀 방지 (codex PR #23 review #3): 이전엔 silent pass 였음. 모델이 본 적 없는 파일
+    (체크아웃에 없는 삭제 파일 / fictional path) 에 대한 phantom quote `[Critical]` 이
+    그대로 차단 신호로 게시되던 보안+정확성 회귀. 이제 검증 불가 = 강등.
+    """
     finding = Finding(
         path="missing.py", line=1, body="[Critical] 공백이 `\" @x\"` 에 있음"
     )
 
     out = SourceGroundedFindingVerifier().verify(_result(finding), tmp_path)
 
-    assert out.findings[0].body.startswith("[Critical]"), "파일 없음 → 검증 생략, 통과"
+    assert out.findings[0].body.startswith("[Suggestion]"), (
+        "파일 없음 + assertion-hint + 인용 → 강등돼야 (모델이 본 파일 아님)"
+    )
+    assert "missing" in out.findings[0].body  # status 가 메시지에 노출
+    assert "원래 [Critical]" in out.findings[0].body
 
 
-def test_verify_skips_when_line_out_of_range(tmp_path: Path) -> None:
-    """파일은 있지만 line 이 파일 길이 밖이면 검증 생략."""
+def test_verify_does_not_downgrade_missing_file_finding_without_assertion_hint(
+    tmp_path: Path,
+) -> None:
+    """파일 없어도 assertion-hint 없으면 강등 안 함 — 일반 finding 보호.
+
+    회귀 방지: assertion-hint 없는 본문은 일반 권고/제안일 가능성. 파일이 잠시 못 읽혀도
+    그 자체로 phantom quote 신호는 아님 → 보존. 검증 발동 조건은 hint+quote 모두 있을 때만.
+    """
+    finding = Finding(
+        path="missing.py",
+        line=1,
+        body="[Critical] 이 모듈 전체 구조가 다른 모듈과 결합도가 너무 높습니다.",
+    )
+
+    out = SourceGroundedFindingVerifier().verify(_result(finding), tmp_path)
+
+    assert out.findings[0].body.startswith("[Critical]")
+
+
+def test_verify_downgrades_when_line_out_of_range_and_assertion_hint_present(
+    tmp_path: Path,
+) -> None:
+    """파일은 있지만 line 이 파일 길이 밖이면 phantom — 강등.
+
+    회귀 방지 (codex PR #23 review #3): 모델이 잘못된 라인을 가리키는 환각.
+    파일은 보지만 라인 번호가 맞지 않는 경우 "어떤 라인" 인지 알 수 없으니 검증 불가.
+    """
     _write(tmp_path, "x.py", "x = 1\n")
     finding = Finding(
         path="x.py", line=999, body="[Critical] 공백이 `\" @x\"` 에 있음"
@@ -139,7 +175,67 @@ def test_verify_skips_when_line_out_of_range(tmp_path: Path) -> None:
 
     out = SourceGroundedFindingVerifier().verify(_result(finding), tmp_path)
 
-    assert out.findings[0].body.startswith("[Critical]")
+    assert out.findings[0].body.startswith("[Suggestion]")
+    assert "out_of_range" in out.findings[0].body
+
+
+# --- Path traversal 방어 (gemini PR #23 review) ----------------------------
+
+
+def test_verify_downgrades_on_path_traversal_attempt(
+    tmp_path: Path, caplog: object
+) -> None:
+    """모델 출력의 path 가 repo_root 밖을 가리키면 거부 + 강등.
+
+    회귀 방지 (gemini PR #23 review): `path` 는 모델 출력에서 온 신뢰 불가 입력. `..`
+    같은 시퀀스로 repo_root 밖 (예: `/etc/passwd`) 을 가리킬 수 있음. 디스크에서 실제로
+    임의 파일을 읽는 건 정보 노출 경로가 됨. resolve() 후 repo_root 의 자식인지 확인.
+    """
+    import logging
+    import pytest as _pytest
+    caplog_typed: _pytest.LogCaptureFixture = caplog  # type: ignore[assignment]
+
+    finding = Finding(
+        path="../../../etc/passwd",
+        line=1,
+        body="[Critical] 공백이 `\" :root:\"` 에 있음",
+    )
+
+    with caplog_typed.at_level(logging.WARNING):
+        out = SourceGroundedFindingVerifier().verify(_result(finding), tmp_path)
+
+    assert out.findings[0].body.startswith("[Suggestion]"), "traversal path 는 강등"
+    assert "traversal" in out.findings[0].body
+    # 운영 관측: traversal 시도가 WARN 로 기록돼야 모니터링 가능
+    traversal_warns = [
+        r for r in caplog_typed.records if "path traversal" in r.getMessage()
+    ]
+    assert len(traversal_warns) == 1
+
+
+# --- Case-insensitive English assertion hints (codex PR #23 review #2) -----
+
+
+def test_verify_matches_uppercase_english_assertion_hints(tmp_path: Path) -> None:
+    """`Whitespace`/`Typo` 처럼 첫글자 대문자 영문 키워드도 검증 발동해야 한다.
+
+    회귀 방지 (codex PR #23 review #2): 모델은 자연어 출력에서 종종 문장 첫 단어를
+    대문자로 시작 ("Whitespace issue here..."). 이전엔 case-sensitive 매칭이라 hint
+    감지를 못 해 검증을 생략했음 — 환각 finding 이 그대로 통과.
+    """
+    _write(tmp_path, "x.py", "\n" * 4 + "x = 1\n")
+    finding = Finding(
+        path="x.py",
+        line=5,
+        body="[Critical] Whitespace issue: `\" leading\"` should not be there.",
+    )
+
+    out = SourceGroundedFindingVerifier().verify(_result(finding), tmp_path)
+
+    # `" leading"` 은 라인에 없음 + 대문자 hint 감지 → 강등
+    assert out.findings[0].body.startswith("[Suggestion]"), (
+        "Whitespace (대문자) 도 hint 매칭 → 강등 발동해야"
+    )
 
 
 # --- event 재정합 -----------------------------------------------------------

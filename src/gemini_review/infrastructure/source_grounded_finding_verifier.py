@@ -21,6 +21,9 @@ logger = logging.getLogger(__name__)
 # 본문에 이런 키워드가 있으면 "원본 텍스트에 대한 단언" 일 가능성 높음 → quote 검증 발동.
 # 정상적인 권고/제안 본문 (예: "pathlib.Path 를 쓰세요") 은 대개 이 키워드 없음 → 거짓
 # 양성 줄임. 새 단언형 키워드가 관찰되면 여기에 누적.
+# 영문 키워드는 모두 소문자로 보관하고, 매칭 시 body 도 소문자로 변환해 비교 — 모델이
+# `Whitespace`/`Typo` 처럼 첫 글자 대문자로 시작해도 검증이 발동하도록
+# (codex PR #23 review #2). 한글 키워드는 case 무관.
 _ASSERTION_HINTS = (
     "공백",
     "띄어쓰기",
@@ -94,14 +97,35 @@ class SourceGroundedFindingVerifier:
         # assertion hint 검사: 키워드 없으면 단순 권고/제안 — 검증 생략 (false positive 방지).
         # 정상 권고 본문 (예: "pathlib.Path 를 쓰세요") 까지 검증하면 인용된 API 이름이
         # 라인에 없다는 이유로 모두 강등돼 신호 가치를 잃는다.
-        if not any(hint in f.body for hint in _ASSERTION_HINTS):
+        # body 를 소문자로 변환해 매칭 — 영문 키워드의 첫글자 대문자 케이스 (예: `Whitespace`,
+        # `Typo`) 도 잡힘 (codex PR #23 review #2).
+        body_lower = f.body.lower()
+        if not any(hint in body_lower for hint in _ASSERTION_HINTS):
             return f
         quotes = _BACKTICK_QUOTE.findall(f.body)
         if not quotes:
             return f
-        line = _read_source_line(repo_root, f.path, f.line, line_cache)
+        line, status = _read_source_line(repo_root, f.path, f.line, line_cache)
+        # 디스크에서 라인을 못 읽은 케이스의 처리 (codex PR #23 review #3):
+        #   - "missing": 변경 파일 목록에는 있지만 체크아웃엔 없음 (삭제된 파일 등)
+        #     → 모델이 실제로 본 파일이 아님 → phantom quote 가능성 → 강등
+        #   - "out_of_range": 파일은 있지만 line 이 범위 밖
+        #     → 모델이 잘못된 라인을 가리킨 환각 → 강등
+        #   - "traversal": path traversal 시도 (../../etc/passwd 류)
+        #     → 명백히 신뢰 불가 입력 → 강등
+        # 이전엔 이 모든 케이스가 silent pass 였음. 모델이 못 본 / 잘못 본 / 악의적 path 의
+        # phantom finding 이 [Critical] 그대로 게시됐던 보안+정확성 회귀.
         if line is None:
-            return f  # 파일 없거나 라인 범위 밖 — 검증 불가, 통과
+            self._log_unverifiable_downgrade(severity, f, status)
+            return Finding(
+                path=f.path,
+                line=f.line,
+                body=(
+                    f"[Suggestion] (자동 강등: {f.path}:{f.line} 의 실제 라인을 "
+                    f"검증할 수 없음 [{status}] — 모델이 본 파일이 아닐 가능성, "
+                    f"원래 [{severity}]) {rest}"
+                ),
+            )
         # Lenient: 인용 중 하나라도 라인에 매치하면 정당한 finding 으로 간주 → 통과.
         # 모든 인용이 라인에 없을 때만 phantom quote 환각으로 강등.
         # 정상 typo/공백 finding 은 `현재값` 과 `수정안` 둘 다 인용하는 패턴이 흔함 —
@@ -129,29 +153,64 @@ class SourceGroundedFindingVerifier:
             ),
         )
 
+    def _log_unverifiable_downgrade(self, severity: str, f: Finding, status: str) -> None:
+        logger.warning(
+            "downgrading severity %s -> Suggestion: cannot verify %s:%d (%s); "
+            "phantom-source defense (assertion-hint keyword + missing source).",
+            severity,
+            f.path,
+            f.line,
+            status,
+        )
+
 
 def _read_source_line(
     repo_root: Path,
     path: str,
     line: int,
     line_cache: dict[str, list[str] | None],
-) -> str | None:
-    """`repo_root / path` 의 1-based line 번호 라인을 반환. 없으면 None.
+) -> tuple[str | None, str]:
+    """`repo_root / path` 의 1-based line 번호 라인을 반환.
+
+    Returns:
+        (line_text, status) 튜플:
+        - 정상: ("실제 라인 텍스트", "ok")
+        - 라인 못 읽음: (None, status) — status 는 호출자가 진단 메시지에 사용
+            - "missing": 파일이 디스크에 없음 (삭제된 파일 등)
+            - "out_of_range": 파일은 있으나 라인 번호 범위 밖
+            - "traversal": path 가 repo_root 밖을 가리킴 (../ 등)
+            - "io_error": 그 외 IO 오류 (권한, 바이너리 등)
 
     같은 verify() 호출 안에서 파일별 라인 리스트를 캐싱해 같은 파일을 여러 번 읽지 않음
-    (codex PR #23 review #2 — 대형 PR 의 파일별 finding 다수 시 I/O 절감).
-    실패 케이스 (파일 없음·바이너리·라인 범위 초과) 는 None 반환 → 검증 생략.
-    silent failure 가 finding 게시를 막으면 안 되므로 보수적으로 통과시킨다.
+    (codex PR #23 review #2). path traversal 방어 (gemini PR #23 review): `path` 는 모델
+    출력에서 온 신뢰 불가 입력이므로 `..` 등으로 repo_root 밖을 가리킬 수 있다. resolve()
+    후 repo_root 의 자식인지 확인 — 아니면 즉시 traversal 로 거부 (캐시도 안 함).
     """
+    # Path traversal 방어 — `..` 등 repo_root 를 벗어나는 경로는 거부.
+    # `resolve()` 는 symlink 도 따라가 최종 경로를 만든다. is_relative_to 로 봉쇄 검증.
+    try:
+        resolved_root = repo_root.resolve()
+        candidate = (repo_root / path).resolve()
+    except OSError:
+        return None, "io_error"
+    if not candidate.is_relative_to(resolved_root):
+        logger.warning(
+            "rejected path traversal in finding: path=%r resolved=%s outside repo_root=%s",
+            path, candidate, resolved_root,
+        )
+        return None, "traversal"
+
     if path in line_cache:
         lines = line_cache[path]
     else:
         try:
-            text = (repo_root / path).read_text(encoding="utf-8", errors="replace")
+            text = candidate.read_text(encoding="utf-8", errors="replace")
             lines = text.splitlines()
         except OSError:
             lines = None
         line_cache[path] = lines
-    if lines is None or line <= 0 or line > len(lines):
-        return None
-    return lines[line - 1]
+    if lines is None:
+        return None, "missing"
+    if line <= 0 or line > len(lines):
+        return None, "out_of_range"
+    return lines[line - 1], "ok"
