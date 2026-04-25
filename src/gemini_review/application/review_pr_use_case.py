@@ -1,6 +1,7 @@
 import logging
 
-from gemini_review.domain import FileDump, PullRequest, TokenBudget
+from gemini_review.domain import FileDump, PullRequest, ReviewResult, TokenBudget
+from gemini_review.infrastructure.gemini_prompt import assemble_pr_diff, build_diff_prompt
 from gemini_review.interfaces import (
     FileCollector,
     FindingDeduper,
@@ -43,27 +44,30 @@ class ReviewPullRequestUseCase:
 
         dump = self._file_collector.collect(repo_path, pr.changed_files, self._budget)
 
-        # 변경 파일이 예산 때문에 잘려 나갔다면 "전체 리뷰"가 성립하지 않는다. 저품질 리뷰를
-        # 게시하느니 리뷰를 건너뛰고 운영자에게 조치 방법을 안내 코멘트로 남긴다.
-        # 변경 파일이 모두 들어간 경우(잘려도 비변경 파일만 제외)는 그대로 리뷰를 수행한다.
+        # 변경 파일이 예산 때문에 잘려 나갔다면 "전체 리뷰"는 성립하지 않는다. 그래도 리뷰를
+        # 완전히 건너뛰는 대신 **diff-only fallback** 으로 우회 시도. PR 전체 코드베이스가 모델
+        # 컨텍스트를 초과하는 큰 저장소도 변경 라인 자체는 거의 항상 모델 한도 안에 들어오므로,
+        # "리뷰 0건" 보다 "diff 만 본 narrower 리뷰" 가 사용자 가치 큼.
+        #
+        # 우선순위:
+        #   1) 일반 모드 (변경 파일 모두 dump 에 들어감) — `engine.review(pr, dump)`
+        #   2) diff fallback (변경 파일이 잘려 나감 + diff 가 비어 있지 않고 budget 안) —
+        #      `engine.review_diff(pr, diff_text)`
+        #   3) notice (diff 도 비었거나 너무 큼) — `_budget_exceeded_message`
         if dump.exceeded_budget and _changed_missing(pr, dump):
-            logger.warning(
-                "budget exceeded for %s#%d — skipping review, posting notice",
+            result = self._fallback_to_diff_review(pr, dump)
+            if result is None:
+                return
+        else:
+            logger.info(
+                "reviewing %s#%d — files=%d chars=%d excluded=%d",
                 pr.repo.full_name,
                 pr.number,
+                len(dump.entries),
+                dump.total_chars,
+                len(dump.excluded),
             )
-            self._github.post_comment(pr, _budget_exceeded_message(pr, dump))
-            return
-
-        logger.info(
-            "reviewing %s#%d — files=%d chars=%d excluded=%d",
-            pr.repo.full_name,
-            pr.number,
-            len(dump.entries),
-            dump.total_chars,
-            len(dump.excluded),
-        )
-        result = self._engine.review(pr, dump)
+            result = self._engine.review(pr, dump)
         # Layer B — 출처 grounding: 모델이 본문에 인용한 텍스트가 실제 소스 라인에 존재
         # 하는지 디스크 레벨로 확인. phantom quote 환각 (예: 모델이 `"@scope"` 를
         # `" @scope"` 로 잘못 토큰화 → "원본에 공백" 단언) 을 [Suggestion] 으로 강등.
@@ -75,9 +79,94 @@ class ReviewPullRequestUseCase:
         self._github.post_review(pr, result)
 
 
+    def _fallback_to_diff_review(
+        self,
+        pr: PullRequest,
+        dump: FileDump,
+    ) -> ReviewResult | None:
+        """전체 dump 가 예산 초과로 변경 파일을 다 못 담을 때의 우회 경로.
+
+        Returns:
+            성공 시 ReviewResult (caller 가 verify/dedupe/post 흐름으로 진행).
+            None 이면 fallback 도 불가 → caller 는 일찍 return (notice 는 본 함수가
+            이미 게시).
+
+        ### 의도된 graceful degrade
+
+        - diff 가 비었거나 (`assemble_pr_diff` 가 모두 binary/truncate 라 None 반환):
+          애초에 모델이 볼 게 없음 → 기존 notice.
+        - diff 는 있지만 **build_diff_prompt 로 합친 실제 입력 크기** (SYSTEM_RULES +
+          DIFF_MODE_NOTICE + PR 메타 + diff 본문) 가 char 예산 초과: 모델 호출이
+          어차피 실패할 가능성 큼 → notice (engine 호출 비용/noise 절감). diff_text
+          본문 길이만 검사하면 fixed prompt overhead 로 실제 입력이 한도를 넘는 경계
+          가 남음 (codex PR #26 review #1).
+
+        ### 예산 비교 정책의 단일 지점 — `TokenBudget.max_chars()`
+
+        char/token 변환 상수는 도메인의 `TokenBudget.chars_per_token()` 로 캡슐화돼
+        있어 use case 가 별도 상수를 두면 두 정책이 어긋날 위험. `self._budget` 인스턴스
+        의 `fits()` 를 직접 사용 — `FileDumpCollector` 와 동일 기준 (codex PR #26
+        review #1 권장 + gemini PR #26 권고).
+        """
+        diff_text = assemble_pr_diff(pr)
+        if not diff_text:
+            logger.warning(
+                "budget exceeded for %s#%d and no diff available — posting notice",
+                pr.repo.full_name,
+                pr.number,
+            )
+            self._github.post_comment(pr, _budget_exceeded_message(pr, dump))
+            return None
+
+        # 실제 모델 입력 = build_diff_prompt 결과. diff_text 만 검사하면 SYSTEM_RULES +
+        # DIFF_MODE_NOTICE + PR 메타 overhead 로 한도 초과 가능 (codex PR #26 review #1).
+        prompt_chars = len(build_diff_prompt(pr, diff_text))
+        if not self._budget.fits(prompt_chars):
+            logger.warning(
+                "budget exceeded for %s#%d and diff prompt also too large "
+                "(prompt_chars=%d > max_chars=%d, diff_chars=%d) — posting notice",
+                pr.repo.full_name,
+                pr.number,
+                prompt_chars,
+                self._budget.max_chars(),
+                len(diff_text),
+            )
+            self._github.post_comment(pr, _budget_exceeded_message(pr, dump))
+            return None
+
+        logger.warning(
+            "budget exceeded for %s#%d — falling back to diff-only review "
+            "(prompt_chars=%d, diff_chars=%d, file_patches=%d)",
+            pr.repo.full_name,
+            pr.number,
+            prompt_chars,
+            len(diff_text),
+            len(pr.file_patches),
+        )
+        return self._engine.review_diff(pr, diff_text)
+
+
 def _changed_missing(pr: PullRequest, dump: FileDump) -> bool:
-    included = {e.path for e in dump.entries}
-    return any(cf not in included for cf in pr.changed_files)
+    """변경 파일 중 **예산 cut** 으로 누락된 파일이 있는지 — fallback 트리거.
+
+    fallback 의 진짜 트리거는 단순함: "변경 파일이 budget_excluded 에 있는가". 직접
+    교집합 검사로 표현해 다른 누락 사유 (의도된 필터 제외, disk 에 없는 삭제 파일 등)
+    까지 잘못 카운트하던 회귀를 모두 한 번에 제거.
+
+    회귀 변천:
+    - 초기: `cf not in entries` — filter-cut 까지 missing 으로 오판 (이미지 PR 강제
+      fallback). gemini PR #26 review #3.
+    - round 4: `cf not in entries and cf not in filtered_out` — filter-cut 은 빠졌지만
+      삭제 파일도 missing 으로 오판 (체크아웃에 없으니 entries/filtered_out 어디에도
+      없음). codex PR #26 review #6.
+    - 현재: `cf in budget_excluded` 직접 검사 — 진짜 트리거 하나만 남김.
+
+    `budget_excluded` 에 들어가는 조건 (file_dump_collector): tracked 파일 중 filter
+    통과 + read 성공 했지만 char 한도로 잘려 나간 파일. 삭제 파일 (tracked 아님), 의도된
+    필터 제외 (filter 단계에서 분기), read 실패 (filtered_out 으로 분류) 모두 제외됨.
+    """
+    budget_cut = set(dump.budget_excluded)
+    return any(cf in budget_cut for cf in pr.changed_files)
 
 
 def _budget_exceeded_message(pr: PullRequest, dump: FileDump) -> str:

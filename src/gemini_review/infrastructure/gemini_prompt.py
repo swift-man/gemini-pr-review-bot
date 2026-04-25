@@ -1,5 +1,7 @@
 from gemini_review.domain import FileDump, FileEntry, PullRequest
 
+from .diff_parser import addable_lines_from_patch, format_patch_with_line_numbers
+
 SYSTEM_RULES = """\
 당신은 숙련된 시니어 개발자이며 GitHub Pull Request의 **전체 코드베이스**를 한국어로 리뷰하는 봇입니다.
 
@@ -270,3 +272,113 @@ def _format_file(entry: FileEntry) -> str:
         f"{i + 1:5d}| {line}" for i, line in enumerate(entry.content.splitlines())
     )
     return f"{header}\n{numbered}\n--- END FILE ---"
+
+
+# --- Diff-only fallback prompt -----------------------------------------------
+
+DIFF_MODE_NOTICE = """\
+## ⚠️ 컨텍스트 모드 — DIFF ONLY (예외 fallback)
+
+이번 리뷰는 PR 의 **전체 코드베이스**가 컨텍스트 한도 (`GEMINI_MAX_INPUT_TOKENS`) 를
+초과해서 **변경된 라인의 unified diff 만** 제공됩니다. 다음 제약을 인지하고 신중히
+리뷰하세요:
+
+- **추가/변경된 `+` 라인**과 hunk 안의 ` ` (context) 라인만 보입니다. 그 너머의
+  unchanged 코드, 다른 파일의 정의, import 그래프, 호출자 영향 등은 **알 수 없음**.
+- **cross-file 단언**, **사용처/호출 영향 단언**, **모듈 구조 단언** 은 diff 만으로는
+  검증 불가 → 차단 등급 ([Critical]/[Major]) 금지. 그런 의심은 [Suggestion] 으로 표기.
+- **`comments[].line`** 은 라인 prefix 의 `  NNNNN|` 번호 (RIGHT 파일 실제 라인) 를
+  그대로 사용. `+` 와 ` ` (context) 라인 모두 인라인 가능 ( `-` 는 RIGHT 에 없음).
+- finding 우선순위는 **`+` 라인 (실제 변경)** 에 집중. context (` `) 라인 의심은
+  보조 자료로만.
+- 그 외의 환각 방지 규칙 (Phantom 공백, false CI failure, 출처 검증) 은 전체 모드와
+  동일하게 적용. 후처리 검증 (`SourceGroundedFindingVerifier`) 도 정상 동작합니다.
+"""
+
+
+def build_diff_prompt(pr: PullRequest, diff_text: str) -> str:
+    """전체 코드베이스 대신 unified diff 만 입력으로 한국어 리뷰 프롬프트를 만든다.
+
+    `build_prompt` 의 fallback 변형. 컨텍스트 예산 (`GEMINI_MAX_INPUT_TOKENS`) 초과로
+    전체 파일 dump 가 불가할 때 use case 가 이 함수로 우회한다.
+
+    `diff_text` 는 `format_patch_with_line_numbers` 로 RIGHT-line annotated 된 unified
+    diff. SYSTEM_RULES + DIFF_MODE_NOTICE + PR 메타 + diff 본문 + 마무리 지시.
+    """
+    sections: list[str] = [
+        SYSTEM_RULES.strip(),
+        "",
+        DIFF_MODE_NOTICE.strip(),
+        "",
+        "=== PR METADATA ===",
+        f"repo: {pr.repo.full_name}",
+        f"number: {pr.number}",
+        f"title: {pr.title}",
+        f"base: {pr.base_ref}  head: {pr.head_ref}",
+        f"head_sha: {pr.head_sha}",
+        f"changed_files ({len(pr.changed_files)}):",
+        *(f"  - {p}" for p in pr.changed_files),
+        "",
+        "=== PR BODY ===",
+        pr.body or "(empty)",
+        "",
+        "=== DIFF (RIGHT-line annotated) ===",
+        "각 hunk 본문 라인은 `  NNNNN| <marker><본문>` 형식 — NNNNN 은 RIGHT 파일의 실제",
+        "라인 번호. `comments[].line` 에는 이 번호를 그대로 사용하세요.",
+        "marker: `+` 추가 / ` ` context (hunk 안 unchanged) / `-` 제거 (RIGHT 에 없음).",
+        "",
+        diff_text,
+        "",
+        "위 diff 만 보고, 지정된 JSON 스키마(positives / improvements / comments)에 맞춘 "
+        "한국어 리뷰를 출력하세요. 모든 `comments` 항목은 diff 안에 존재하는 RIGHT 라인 "
+        "번호를 반드시 포함해야 합니다 (`+` 또는 hunk 안 ` ` 라인).",
+    ]
+    return "\n".join(sections)
+
+
+def assemble_pr_diff(pr: PullRequest) -> str:
+    """PR 의 file_patches 를 LLM 입력용 diff 텍스트로 합친다.
+
+    각 파일을 `--- FILE: path ---` 헤더 + RIGHT-annotated patch + `--- END FILE ---`
+    로 감싸서 join. 파일이 0 개거나 모든 patch 가 binary/truncate 로 None 이었으면
+    빈 문자열 반환 — caller 가 빈 결과를 보고 fallback 을 포기해야 한다.
+
+    ### 삭제-only patch 제외 (codex PR #26 review #2)
+
+    `addable_lines_from_patch` 가 빈 set 을 돌려주는 patch (= RIGHT 라인이 하나도 없는
+    경우 — 전체 파일 삭제 등) 는 fallback 입력에서 제외한다. 모델이 review 해도
+    `(path, line)` 인라인 게시 불가하고, RIGHT 에 없는 내용을 phantom 단언할 risk 만
+    늘어남. PR description / 변경 파일 목록은 prompt 의 PR METADATA 섹션에 그대로
+    있어 "어떤 파일이 삭제됐다" 라는 큰 그림 정보는 보존됨.
+
+    `paths_in_pr_diff(pr)` 와 같은 필터 규칙을 사용해 두 함수가 항상 같은 파일 집합을
+    참조하도록 한다 (codex PR #26 review #4 — diff 입력 밖 파일에 대한 환각 finding 이
+    valid_paths 통과되던 회귀 방지).
+    """
+    blocks: list[str] = []
+    for path, patch in pr.file_patches:
+        # 삭제-only patch 는 RIGHT 인라인 코멘트 불가 → diff fallback 에서 제외.
+        # `addable_lines_from_patch` 와 같은 카운터 규칙으로 판정 일관성 보장.
+        if not addable_lines_from_patch(patch):
+            continue
+        annotated = format_patch_with_line_numbers(patch)
+        if not annotated:
+            continue
+        blocks.append(f"--- FILE: {path} ---\n{annotated}\n--- END FILE ---")
+    return "\n\n".join(blocks)
+
+
+def paths_in_pr_diff(pr: PullRequest) -> frozenset[str]:
+    """`assemble_pr_diff` 에 실제 포함되는 파일 경로 집합 — diff 모드 valid_paths.
+
+    회귀 방지 (codex PR #26 review #4): diff fallback 에서 `parse_review(valid_paths=
+    pr.changed_files)` 로 valid 를 정하면 PR 전체 변경 파일이 인정됨. 그런데
+    `assemble_pr_diff` 는 삭제-only / binary / truncate patch 를 입력에서 제외하므로,
+    모델이 PR METADATA 만 보고 그 파일에 대한 환각 finding 을 만들면 파서에서 안 걸리고
+    본문 surface 로 게시됨. 두 함수가 같은 필터 규칙을 따르도록 헬퍼로 분리.
+    """
+    return frozenset(
+        path
+        for path, patch in pr.file_patches
+        if addable_lines_from_patch(patch)
+    )

@@ -92,8 +92,16 @@ class FakeCollector:
 class FakeEngine:
     def __init__(self, result: ReviewResult) -> None:
         self._result = result
+        # diff fallback 진입 시 사용된 인자 기록 — 테스트 검증용
+        self.diff_calls: list[tuple[PullRequest, str]] = []
 
     def review(self, pr: PullRequest, dump: FileDump) -> ReviewResult:
+        return self._result
+
+    def review_diff(self, pr: PullRequest, diff_text: str) -> ReviewResult:
+        # diff fallback 흐름 테스트가 결과를 일반 review 와 구분할 수 있도록 새 객체로 반환.
+        # 호출 인자도 함께 기록해 fallback 진입 자체와 입력 내용을 검증 가능.
+        self.diff_calls.append((pr, diff_text))
         return self._result
 
 
@@ -234,13 +242,21 @@ def test_accept_ignores_unsupported_action(tmp_path: Path) -> None:
     assert code == 202
 
 
-def test_use_case_posts_comment_when_budget_exceeded(tmp_path: Path) -> None:
+def test_use_case_posts_comment_when_budget_exceeded_and_no_diff_available(
+    tmp_path: Path,
+) -> None:
+    """예산 초과 + 변경 파일이 binary/truncate 라 patch 가 없으면 → notice 게시.
+
+    회귀 방지: diff fallback 이 도입돼도 patch 가 없는 경우는 그대로 notice 경로 유지.
+    `_sample_pr()` 가 `file_patches=()` 라 fallback 이 빈 diff 를 반환 → notice fall-through.
+    """
     github = FakeGitHub()
-    pr = _sample_pr()
+    pr = _sample_pr()  # file_patches=() default
     dump = FileDump(
         entries=(),
         total_chars=0,
         excluded=("a.py",),
+        budget_excluded=("a.py",),  # codex PR #26 review #6: budget cut 직접 명시
         exceeded_budget=True,
         budget=TokenBudget(1),
     )
@@ -256,6 +272,276 @@ def test_use_case_posts_comment_when_budget_exceeded(tmp_path: Path) -> None:
 
     use_case.execute(pr)
 
+    assert github.posted_reviews == []
+    assert len(github.posted_comments) == 1
+    assert "예산 초과" in github.posted_comments[0][1]
+
+
+def test_use_case_falls_back_to_diff_review_when_budget_exceeded_with_patches(
+    tmp_path: Path,
+) -> None:
+    """예산 초과 + 변경 파일 patch 존재 → diff fallback 으로 리뷰 수행 + post_review 게시.
+
+    핵심 회귀 방지 (사용자 신고): 큰 저장소에서 GEMINI_MAX_INPUT_TOKENS 초과 시 이전엔
+    리뷰 자체를 skip 하고 notice 만 남겼는데, 이제는 diff 만으로라도 리뷰를 수행해
+    "0건" 보다 "narrower 리뷰" 를 사용자에게 제공.
+    """
+    github = FakeGitHub()
+    pr = PullRequest(
+        repo=RepoRef("o", "r"),
+        number=42,
+        title="대형 PR",
+        body="",
+        head_sha="abc",
+        head_ref="feat",
+        base_sha="def",
+        base_ref="main",
+        clone_url="https://example/x.git",
+        changed_files=("a.py",),
+        installation_id=7,
+        is_draft=False,
+        file_patches=(("a.py", "@@ -1,1 +1,2 @@\n a\n+B\n"),),
+    )
+    # 예산은 SYSTEM_RULES (~5KB) + DIFF_MODE_NOTICE + PR 메타 + diff 본문 합쳐 들어갈
+    # 만큼. 50000 tokens = 200000 chars 로 작은 diff 테스트는 여유롭게 통과.
+    dump = FileDump(
+        entries=(),
+        total_chars=0,
+        excluded=("a.py",),
+        budget_excluded=("a.py",),  # codex PR #26 review #6: budget cut 직접 명시
+        exceeded_budget=True,
+        budget=TokenBudget(50000),
+    )
+    expected = ReviewResult(summary="diff-review", event=ReviewEvent.COMMENT)
+    engine = FakeEngine(expected)
+    use_case = ReviewPullRequestUseCase(
+        github=github,
+        repo_fetcher=FakeFetcher(tmp_path),
+        file_collector=FakeCollector(dump),
+        engine=engine,
+        finding_verifier=FakeFindingVerifier(),
+        finding_deduper=FakeFindingDeduper(),
+        max_input_tokens=50000,
+    )
+
+    use_case.execute(pr)
+
+    assert len(engine.diff_calls) == 1, "engine.review_diff 가 호출돼야"
+    assert engine.diff_calls[0][0] is pr
+    assert "a.py" in engine.diff_calls[0][1], "diff_text 에 변경 파일 경로 포함돼야"
+    assert "+B" in engine.diff_calls[0][1], "diff_text 에 추가 라인 포함돼야"
+    assert github.posted_comments == [], "diff fallback 에선 notice 게시 안 함"
+    assert len(github.posted_reviews) == 1
+    assert github.posted_reviews[0][1] is expected, "diff review 결과가 그대로 게시돼야"
+
+
+def test_use_case_does_not_fallback_when_changed_file_is_deleted_from_disk(
+    tmp_path: Path,
+) -> None:
+    """삭제 파일이 changed_files 에 있어도 fallback 강제 발동되면 안 됨.
+
+    회귀 방지 (codex PR #26 review #6): 이전 `_changed_missing` 가
+    `cf not in entries and cf not in filtered_out` 검사 → 삭제 파일은 disk 에 없으니
+    entries 에도 없고, `git ls-files` 가 안 잡으니 filtered_out 에도 없음 → budget cut
+    이 아닌데도 missing 으로 오판해 강제 fallback. 사용자에겐 삭제 파일 1개로 인해 모든
+    리뷰가 diff-only 모드가 되는 회귀.
+
+    이제는 `_changed_missing` 가 `cf in budget_excluded` 직접 검사 → 삭제 파일은 budget
+    cut 이 아니라 정상 review 경로 진행.
+    """
+    github = FakeGitHub()
+    pr = _sample_pr()  # changed_files=("a.py",) — 삭제됐다고 가정
+    # 삭제 파일은 entries / filtered_out / budget_excluded 어디에도 없음
+    # (collector 가 disk 에 없는 파일을 처리하지 않으므로). dump 는 정상적으로 다른
+    # 파일들로 채워졌다고 시뮬레이션 — 예산 안에 들어감.
+    dump = FileDump(
+        entries=(FileEntry(path="other.py", content="x", size_bytes=1, is_changed=False),),
+        total_chars=1,
+        excluded=(),
+        filtered_out=(),
+        budget_excluded=(),  # 예산 cut 없음 — 코드베이스 전체가 예산 안에 들어감
+        exceeded_budget=False,
+        budget=TokenBudget(1000),
+    )
+    expected = ReviewResult(summary="normal-review", event=ReviewEvent.COMMENT)
+    engine = FakeEngine(expected)
+    use_case = ReviewPullRequestUseCase(
+        github=github,
+        repo_fetcher=FakeFetcher(tmp_path),
+        file_collector=FakeCollector(dump),
+        engine=engine,
+        finding_verifier=FakeFindingVerifier(),
+        finding_deduper=FakeFindingDeduper(),
+        max_input_tokens=1000,
+    )
+
+    use_case.execute(pr)
+
+    assert engine.diff_calls == [], (
+        "삭제 파일이 changed_files 에 있어도 budget cut 이 아니므로 fallback 진입 X"
+    )
+    assert github.posted_comments == [], "예산 초과 notice 게시 X"
+    assert len(github.posted_reviews) == 1, "일반 review 경로 통과"
+    assert github.posted_reviews[0][1] is expected
+
+
+def test_use_case_does_not_fallback_when_only_filter_cut_changed_files(
+    tmp_path: Path,
+) -> None:
+    """이미지/lock 같은 의도된 필터 제외 파일만 변경된 PR 은 강제 fallback 으로 빠지면 안 됨.
+
+    회귀 방지 (gemini PR #26 review #3): 이전엔 dump 의 `excluded` 가 filter + budget
+    cut 을 구분 없이 담고 `_changed_missing` 가 단순 `cf not in entries` 검사라, 이미지
+    1개만 변경된 PR 도 `exceeded_budget=True` + `_changed_missing=True` 로 판정돼 강제
+    diff fallback 으로 빠짐. 이제는 dump.filtered_out 가 분리 보고되어 use case 의
+    `_changed_missing` 가 의도된 필터 제외를 missing 신호로 카운트하지 않음.
+
+    이 테스트는 변경 파일이 모두 filtered_out 에 있고 budget_excluded 가 비었다는 상황
+    → exceeded_budget=False → 일반 review 경로 (fallback 진입 자체 안 함).
+    """
+    github = FakeGitHub()
+    pr = _sample_pr()  # changed_files=("a.py",)
+    # 변경 파일이 필터로 제외됐다고 시뮬레이션 (FileDumpCollector 가 만드는 상태)
+    dump = FileDump(
+        entries=(),
+        total_chars=0,
+        excluded=("a.py",),
+        filtered_out=("a.py",),  # 필터 제외만 — 예산 cut 아님
+        budget_excluded=(),
+        exceeded_budget=False,  # filter-only 는 budget 신호가 아님
+        budget=TokenBudget(1000),
+    )
+    expected = ReviewResult(summary="normal-review", event=ReviewEvent.COMMENT)
+    engine = FakeEngine(expected)
+    use_case = ReviewPullRequestUseCase(
+        github=github,
+        repo_fetcher=FakeFetcher(tmp_path),
+        file_collector=FakeCollector(dump),
+        engine=engine,
+        finding_verifier=FakeFindingVerifier(),
+        finding_deduper=FakeFindingDeduper(),
+        max_input_tokens=1000,
+    )
+
+    use_case.execute(pr)
+
+    assert engine.diff_calls == [], "필터 제외만이면 diff fallback 진입 X"
+    assert github.posted_comments == [], "예산 초과 notice 게시 X"
+    assert len(github.posted_reviews) == 1, "일반 review 경로 통과"
+    assert github.posted_reviews[0][1] is expected
+
+
+def test_use_case_size_check_uses_full_prompt_not_just_diff_text(
+    tmp_path: Path,
+) -> None:
+    """예산 초과 검사는 build_diff_prompt 결과 전체 길이로 — diff_text 만 검사하면 회귀.
+
+    회귀 방지 (codex PR #26 review #1): 이전엔 `len(diff_text) > max_chars` 만 검사해
+    SYSTEM_RULES + DIFF_MODE_NOTICE + PR 메타 overhead 가 추가되면 실제 prompt 가
+    예산 초과해 모델이 거부하는 경계가 남았다. 이제는 build_diff_prompt(pr, diff_text)
+    결과 길이로 검사해 fallback 전 차단.
+
+    이 테스트는 raw diff_text 는 작지만 (수십 chars) 예산을 SYSTEM_RULES 보다 작게
+    잡아 prompt 전체로는 초과하는 경계 케이스. fallback 이 시도되면 안 되고 notice 가
+    게시돼야.
+    """
+    github = FakeGitHub()
+    pr = PullRequest(
+        repo=RepoRef("o", "r"),
+        number=42,
+        title="t",
+        body="",
+        head_sha="abc",
+        head_ref="feat",
+        base_sha="def",
+        base_ref="main",
+        clone_url="https://example/x.git",
+        changed_files=("a.py",),
+        installation_id=7,
+        is_draft=False,
+        # raw patch 는 소량 (~50 chars)
+        file_patches=(("a.py", "@@ -1,1 +1,1 @@\n-x\n+y\n"),),
+    )
+    # SYSTEM_RULES 만 ~5KB. token=500 (= 2000 chars) 면 SYSTEM_RULES 도 못 담음 →
+    # diff_text 본문 길이 (50 chars 미만) 만 검사하던 이전 로직은 이 케이스를 통과시켜
+    # engine 호출까지 갔던 회귀를 lock.
+    dump = FileDump(
+        entries=(),
+        total_chars=0,
+        excluded=("a.py",),
+        budget_excluded=("a.py",),  # codex PR #26 review #6: budget cut 직접 명시
+        exceeded_budget=True,
+        budget=TokenBudget(500),
+    )
+    engine = FakeEngine(ReviewResult(summary="x", event=ReviewEvent.COMMENT))
+    use_case = ReviewPullRequestUseCase(
+        github=github,
+        repo_fetcher=FakeFetcher(tmp_path),
+        file_collector=FakeCollector(dump),
+        engine=engine,
+        finding_verifier=FakeFindingVerifier(),
+        finding_deduper=FakeFindingDeduper(),
+        max_input_tokens=500,
+    )
+
+    use_case.execute(pr)
+
+    assert engine.diff_calls == [], (
+        "diff 본문은 작아도 SYSTEM_RULES + DIFF_MODE_NOTICE + 메타 합치면 예산 초과 → "
+        "engine 호출 없이 notice"
+    )
+    assert github.posted_reviews == []
+    assert len(github.posted_comments) == 1
+    assert "예산 초과" in github.posted_comments[0][1]
+
+
+def test_use_case_posts_notice_when_diff_itself_too_large(
+    tmp_path: Path,
+) -> None:
+    """예산 초과 + diff 도 budget 초과 → notice (engine 호출 안 함, rate-limit 절감).
+
+    회귀 방지: diff fallback 이 무조건 시도되면 거대 patch 가 들어오는 PR 에서 모델
+    호출이 100% 실패. 게시 가치 없는 호출은 사전 차단해 GEMINI 호출 비용 + 시간 절감.
+    """
+    github = FakeGitHub()
+    huge_patch = "@@ -1,1 +1,1 @@\n" + ("+x\n" * 5000)  # 약 15000 chars
+    pr = PullRequest(
+        repo=RepoRef("o", "r"),
+        number=42,
+        title="대형 PR",
+        body="",
+        head_sha="abc",
+        head_ref="feat",
+        base_sha="def",
+        base_ref="main",
+        clone_url="https://example/x.git",
+        changed_files=("big.py",),
+        installation_id=7,
+        is_draft=False,
+        file_patches=(("big.py", huge_patch),),
+    )
+    dump = FileDump(
+        entries=(),
+        total_chars=0,
+        excluded=("big.py",),
+        budget_excluded=("big.py",),  # codex PR #26 review #6: budget cut 직접 명시
+        exceeded_budget=True,
+        budget=TokenBudget(100),  # 100 tokens × 4 chars = 400 char budget — diff 훨씬 큼
+    )
+    engine = FakeEngine(ReviewResult(summary="x", event=ReviewEvent.COMMENT))
+    use_case = ReviewPullRequestUseCase(
+        github=github,
+        repo_fetcher=FakeFetcher(tmp_path),
+        file_collector=FakeCollector(dump),
+        engine=engine,
+        finding_verifier=FakeFindingVerifier(),
+        finding_deduper=FakeFindingDeduper(),
+        max_input_tokens=100,
+    )
+
+    use_case.execute(pr)
+
+    assert engine.diff_calls == [], "diff 가 너무 커서 engine 호출 안 함"
     assert github.posted_reviews == []
     assert len(github.posted_comments) == 1
     assert "예산 초과" in github.posted_comments[0][1]

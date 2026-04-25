@@ -544,6 +544,12 @@ def test_fetch_pull_request_collects_addable_lines_with_single_files_call(
     # binary 파일은 patch=None → 빈 frozenset (보수적)
     assert addable["binary.png"] == frozenset()
 
+    # file_patches 도 같은 호출에서 함께 수집됐어야 — diff fallback 입력 (binary 는 제외)
+    patches_by_path = dict(pr.file_patches)
+    assert patches_by_path == {"src/a.py": "@@ -1,0 +5,2 @@\n+x\n+y\n"}, (
+        "binary/None patch 파일은 file_patches 에서 제외 — diff fallback 의 입력 후보 X"
+    )
+
 
 def _build_fake_urlopen_for_fetch_pr(
     *,

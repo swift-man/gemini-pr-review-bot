@@ -39,6 +39,12 @@ class PullRequest:
     # 빈 frozenset 은 binary 파일·삭제 파일·GitHub truncate 등 인라인 불가 케이스.
     # 형식: `((path, frozenset(lines)), ...)` — frozen dataclass 호환을 위해 dict 대신 tuple.
     addable_lines: tuple[tuple[str, frozenset[int]], ...] = field(default_factory=tuple)
+    # 각 변경 파일의 raw GitHub patch text (unified diff hunk 들). 컨텍스트 예산 초과로
+    # 전체 코드베이스 리뷰가 불가할 때 diff-only fallback 리뷰의 입력이 된다.
+    # `addable_lines` 와 동일한 push race 방지 이유로 `head_sha` 시점에 한 번만 수집·캐시.
+    # binary/삭제/truncate 파일은 patch 가 None 으로 와서 이 튜플에서 제외된다.
+    # 형식: `((path, raw_patch_text), ...)` — frozen 호환 + addable_lines 와 짝.
+    file_patches: tuple[tuple[str, str], ...] = field(default_factory=tuple)
 
     def effective_fetch_ref(self) -> str:
         """실제 `git fetch` 에 사용할 ref — `fetch_ref` 가 비어 있으면 `head_sha` 로 fallback.

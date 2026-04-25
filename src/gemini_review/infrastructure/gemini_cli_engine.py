@@ -7,7 +7,16 @@ from pathlib import Path
 from gemini_review.domain import FileDump, PullRequest, ReviewResult
 
 from .gemini_parser import parse_review
-from .gemini_prompt import build_prompt
+from .gemini_prompt import build_diff_prompt, build_prompt, paths_in_pr_diff
+
+# diff fallback 시 ReviewResult.summary 에 prepend 되는 사용자 안내 (gemini PR #26
+# review #4 권고). PR 본문 상단에 이 문구가 노출돼 리뷰 수신자가 "전체 코드가 아니라
+# 변경 라인만 본 narrower 리뷰" 임을 인지하고 cross-file 단언은 보수적으로 참고.
+_DIFF_MODE_SUMMARY_NOTICE = (
+    "⚠️ **이 리뷰는 diff-only fallback 모드로 작성되었습니다** "
+    "(전체 코드베이스가 컨텍스트 한도를 초과). cross-file 영향·외부 모듈 사용처는 "
+    "검증되지 않았으니 보수적으로 참고하세요.\n\n"
+)
 
 logger = logging.getLogger(__name__)
 
@@ -123,6 +132,71 @@ class GeminiCliEngine:
 
     def review(self, pr: PullRequest, dump: FileDump) -> ReviewResult:
         prompt = build_prompt(pr, dump)
+        # 전체 모드의 valid_paths 는 PR 전체 변경 파일 — 일반 흐름은 모든 변경 파일에
+        # 대해 finding 을 받는 게 정상.
+        return self._run_with_model_fallback(
+            pr=pr,
+            prompt=prompt,
+            valid_paths=frozenset(pr.changed_files),
+            invoke_log_kv={
+                "files": len(dump.entries),
+                "chars": dump.total_chars,
+                "mode": "full",
+            },
+        )
+
+    def review_diff(self, pr: PullRequest, diff_text: str) -> ReviewResult:
+        """전체 코드베이스 컨텍스트 한도 초과 시의 fallback — diff 만으로 리뷰 수행.
+
+        프롬프트가 모델에게 cross-file 단언 금지 + [Critical]/[Major] 등급 절제를
+        강하게 안내하므로, 같은 모델/타임아웃/fallback chain 정책을 그대로 재사용한다.
+        결과 ReviewResult 의 형식은 `review()` 와 동일 — 호출부 (use case) 가 같은
+        후처리 (verify, dedupe, post) 흐름을 적용 가능.
+
+        ### 차이 (codex/gemini PR #26 review #4)
+
+        1. valid_paths 가 `paths_in_pr_diff(pr)` — `assemble_pr_diff` 에 실제 포함된
+           파일만 인정. 삭제-only / binary / truncate 처럼 diff 입력에서 제외된 파일
+           에 대한 환각 finding 이 PR METADATA 만 보고 만들어져도 파서에서 드롭됨.
+        2. ReviewResult.summary 에 diff-only 모드 안내 prepend — 리뷰 수신자가 본문
+           상단에서 narrower 리뷰임을 즉시 인지.
+        """
+        prompt = build_diff_prompt(pr, diff_text)
+        valid_paths = paths_in_pr_diff(pr)
+        result = self._run_with_model_fallback(
+            pr=pr,
+            prompt=prompt,
+            valid_paths=valid_paths,
+            invoke_log_kv={
+                "diff_chars": len(diff_text),
+                "files": len(valid_paths),
+                "mode": "diff",
+            },
+        )
+        # 사용자 가시성: 본문 상단에 모드 명시 — 후처리 (verify/dedupe) 는 summary 를
+        # 건드리지 않으므로 여기서 prepend 하면 최종 게시까지 그대로 노출됨.
+        return dataclasses.replace(
+            result, summary=_DIFF_MODE_SUMMARY_NOTICE + result.summary
+        )
+
+    def _run_with_model_fallback(
+        self,
+        *,
+        pr: PullRequest,
+        prompt: str,
+        valid_paths: frozenset[str],
+        invoke_log_kv: dict[str, object],
+    ) -> ReviewResult:
+        """모델 fallback chain 으로 prompt 를 태우는 공유 루프.
+
+        review() / review_diff() 두 진입점이 같은 retryable 실패 정책 (timeout, empty
+        stdout, capacity/preview 실패 마커) 으로 fallback 모델을 순회하도록 한 곳에
+        모았다. invoke_log_kv 는 진단 로그용 모드별 메타.
+
+        valid_paths 는 파서의 path grounding 입력 — 모델이 실제 컨텍스트에 없던 파일
+        이름을 만들어 내면 finding 단계에서 드롭. review() 는 PR 전체 changed_files,
+        review_diff() 는 diff 에 실제 포함된 파일 (codex PR #26 review #4) 로 좁혀짐.
+        """
         models = _dedupe_models(self._model, self._fallback_models)
         last_error = ""
         for index, model in enumerate(models):
@@ -133,7 +207,7 @@ class GeminiCliEngine:
             # 체인에 태운다. 이 블록을 _invoke_review 내부에서 RuntimeError 로 변환하면
             # 루프 자체를 빠져나가 fallback 이 발동하지 않는 회귀가 생긴다.
             try:
-                result = self._invoke_review(model, prompt, dump)
+                result = self._invoke_review(model, prompt, invoke_log_kv)
             except subprocess.TimeoutExpired:
                 if not has_fallback:
                     raise RuntimeError(
@@ -180,12 +254,11 @@ class GeminiCliEngine:
                 # `parse_review` 는 CLI 출력만 해석하므로 어느 모델이 이 결과를 만들었는지
                 # 모른다. 여기서 한 번에 주입해서 fallback 발동 시 운영자가 본문 푸터로
                 # 실제 사용 모델을 바로 확인할 수 있게 한다.
-                # `valid_paths` 는 path grounding — 모델이 PR 에 존재하지 않는 파일을
-                # 지적하는 환각(예: fictional `tests/unit/test_github_app_client.py`) 을
-                # 파서 단계에서 드롭하는 데 쓰인다.
-                parsed = parse_review(
-                    result.stdout, valid_paths=frozenset(pr.changed_files)
-                )
+                # `valid_paths` 는 path grounding — 모델이 컨텍스트에 없던 파일 이름을
+                # 만들어 내면 finding 단계에서 드롭. caller (`review`/`review_diff`) 가
+                # 모드에 맞는 set 을 주입 (codex PR #26 review #4: diff 모드에선
+                # changed_files 전체가 아니라 diff 입력 실제 포함된 파일로 좁혀짐).
+                parsed = parse_review(result.stdout, valid_paths=valid_paths)
                 return dataclasses.replace(parsed, model=model)
 
             last_error = _combined_output(result)
@@ -209,7 +282,7 @@ class GeminiCliEngine:
         self,
         model: str,
         prompt: str,
-        dump: FileDump,
+        log_kv: dict[str, object],
     ) -> subprocess.CompletedProcess[str]:
         # Gemini CLI 0.38.x 는 `-p/--prompt` 뒤에 문자열 인자를 요구한다. 실제 전체 레포
         # 프롬프트는 계속 stdin 으로 흘려 보내 ARG_MAX 를 피하고, argv 에는 non-empty
@@ -223,9 +296,8 @@ class GeminiCliEngine:
             _STDIN_PROMPT_PLACEHOLDER,
         ]
         logger.info(
-            "invoking gemini: files=%d chars=%d model=%s",
-            len(dump.entries),
-            dump.total_chars,
+            "invoking gemini: %s model=%s",
+            " ".join(f"{k}={v}" for k, v in log_kv.items()),
             model,
         )
         # TimeoutExpired 는 일부러 잡지 않고 그대로 propagate — caller 인 `review()` 가
