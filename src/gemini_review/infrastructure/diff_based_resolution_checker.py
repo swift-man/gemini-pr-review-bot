@@ -127,9 +127,14 @@ class DiffBasedResolutionChecker:
             # 라인 본문 변화 없음 → 메인테이너 처리 신호 X → reply 안 함
             return
 
+        # 본문/로그 SHA = head_line 을 실제 읽은 SHA (coderabbitai PR #28 review #4 +
+        # gemini round 1 line 132). GitHub 가 아직 comment.commit_id 를 pr.head_sha 로
+        # 추적 갱신하지 못한 순간 "표시 SHA" ≠ "비교 SHA" 가 되어 메인테이너 혼란.
+        # comment.commit_id 로 일치시키면 본문에 보여준 SHA 의 라인을 그대로 비교한 결과
+        # 라는 invariant 가 명확해진다.
         body = _build_resolution_reply(
             prior_sha=comment.original_commit_id,
-            head_sha=pr.head_sha,
+            head_sha=comment.commit_id,
             prior_line=prior_line,
             head_line=head_line,
         )
@@ -152,7 +157,7 @@ class DiffBasedResolutionChecker:
             comment.path,
             comment.original_line,
             comment.original_commit_id[:7],
-            pr.head_sha[:7],
+            comment.commit_id[:7],
         )
 
 

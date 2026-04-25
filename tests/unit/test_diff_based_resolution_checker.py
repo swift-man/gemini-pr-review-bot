@@ -578,6 +578,52 @@ def test_check_safely_handles_undecodable_bytes_in_source(
     assert fake.replies == [], "동일 치환 결과 비교 → 변경 없음 → reply 안 함 (그리고 예외 없음)"
 
 
+def test_check_reply_body_sha_matches_actually_read_sha_not_pr_head(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """reply 본문/로그에 표시되는 head SHA = head_line 을 실제 읽은 SHA (= comment.commit_id).
+
+    회귀 방지 (coderabbitai PR #28 review #4 + gemini round 1 line 132): GitHub 가 아직
+    comment.commit_id 를 pr.head_sha 로 추적 갱신하지 못한 순간 "표시 SHA" 와 "비교 SHA"
+    가 어긋나 메인테이너가 잘못된 commit 을 확인하는 혼란. reply 본문에 표시되는 head
+    SHA 는 반드시 head_line 을 실제 읽은 SHA (= comment.commit_id) 와 같아야.
+    """
+    # GitHub 가 추적 갱신을 못한 시뮬: comment.commit_id 와 pr.head_sha 가 다름
+    pr_head = "newshahead"
+    comment_current_sha = "midshaaaa"  # GitHub 가 여기까지만 추적 갱신
+    existing = (
+        _posted(
+            comment_id=7001,
+            commit_id=comment_current_sha,  # GitHub-tracked < pr.head_sha
+            path="a.py",
+            line=10,
+            body="[Major] 잠재 버그",
+            original_commit_id="oldshaaa",
+            original_line=10,
+        ),
+    )
+    _patch_git_show(monkeypatch, {
+        ("oldshaaa", "a.py"): "\n" * 9 + "old\n",
+        (comment_current_sha, "a.py"): "\n" * 9 + "new\n",
+    })
+
+    fake = _FakeGitHub(existing=existing)
+    DiffBasedResolutionChecker(fake).check_resolutions(_pr(head_sha=pr_head), tmp_path)
+
+    assert len(fake.replies) == 1
+    body = fake.replies[0][2]
+    # 본문에 보여줘야 하는 head SHA = 실제 head_line 읽은 SHA (= comment.commit_id)
+    assert comment_current_sha[:7] in body, (
+        f"reply 본문의 head SHA 는 head_line 을 실제 읽은 SHA ({comment_current_sha[:7]}) "
+        f"와 일치해야. 실제 본문: {body!r}"
+    )
+    # pr.head_sha (모델이 새 리뷰 게시한 SHA) 는 본문에 등장하면 안 됨 — 두 값이
+    # 같을 수도 있지만 이 테스트의 시나리오는 다른 값 (GitHub 추적 lag) 을 모사
+    assert pr_head[:7] not in body, (
+        f"reply 본문에 pr.head_sha ({pr_head[:7]}) 가 들어가면 비교 SHA 와 어긋남"
+    )
+
+
 def test_check_renders_line_content_in_code_block_safe_to_backticks(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
