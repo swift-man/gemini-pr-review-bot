@@ -256,6 +256,7 @@ def test_use_case_posts_comment_when_budget_exceeded_and_no_diff_available(
         entries=(),
         total_chars=0,
         excluded=("a.py",),
+        budget_excluded=("a.py",),  # codex PR #26 review #6: budget cut 직접 명시
         exceeded_budget=True,
         budget=TokenBudget(1),
     )
@@ -307,6 +308,7 @@ def test_use_case_falls_back_to_diff_review_when_budget_exceeded_with_patches(
         entries=(),
         total_chars=0,
         excluded=("a.py",),
+        budget_excluded=("a.py",),  # codex PR #26 review #6: budget cut 직접 명시
         exceeded_budget=True,
         budget=TokenBudget(50000),
     )
@@ -331,6 +333,56 @@ def test_use_case_falls_back_to_diff_review_when_budget_exceeded_with_patches(
     assert github.posted_comments == [], "diff fallback 에선 notice 게시 안 함"
     assert len(github.posted_reviews) == 1
     assert github.posted_reviews[0][1] is expected, "diff review 결과가 그대로 게시돼야"
+
+
+def test_use_case_does_not_fallback_when_changed_file_is_deleted_from_disk(
+    tmp_path: Path,
+) -> None:
+    """삭제 파일이 changed_files 에 있어도 fallback 강제 발동되면 안 됨.
+
+    회귀 방지 (codex PR #26 review #6): 이전 `_changed_missing` 가
+    `cf not in entries and cf not in filtered_out` 검사 → 삭제 파일은 disk 에 없으니
+    entries 에도 없고, `git ls-files` 가 안 잡으니 filtered_out 에도 없음 → budget cut
+    이 아닌데도 missing 으로 오판해 강제 fallback. 사용자에겐 삭제 파일 1개로 인해 모든
+    리뷰가 diff-only 모드가 되는 회귀.
+
+    이제는 `_changed_missing` 가 `cf in budget_excluded` 직접 검사 → 삭제 파일은 budget
+    cut 이 아니라 정상 review 경로 진행.
+    """
+    github = FakeGitHub()
+    pr = _sample_pr()  # changed_files=("a.py",) — 삭제됐다고 가정
+    # 삭제 파일은 entries / filtered_out / budget_excluded 어디에도 없음
+    # (collector 가 disk 에 없는 파일을 처리하지 않으므로). dump 는 정상적으로 다른
+    # 파일들로 채워졌다고 시뮬레이션 — 예산 안에 들어감.
+    dump = FileDump(
+        entries=(FileEntry(path="other.py", content="x", size_bytes=1, is_changed=False),),
+        total_chars=1,
+        excluded=(),
+        filtered_out=(),
+        budget_excluded=(),  # 예산 cut 없음 — 코드베이스 전체가 예산 안에 들어감
+        exceeded_budget=False,
+        budget=TokenBudget(1000),
+    )
+    expected = ReviewResult(summary="normal-review", event=ReviewEvent.COMMENT)
+    engine = FakeEngine(expected)
+    use_case = ReviewPullRequestUseCase(
+        github=github,
+        repo_fetcher=FakeFetcher(tmp_path),
+        file_collector=FakeCollector(dump),
+        engine=engine,
+        finding_verifier=FakeFindingVerifier(),
+        finding_deduper=FakeFindingDeduper(),
+        max_input_tokens=1000,
+    )
+
+    use_case.execute(pr)
+
+    assert engine.diff_calls == [], (
+        "삭제 파일이 changed_files 에 있어도 budget cut 이 아니므로 fallback 진입 X"
+    )
+    assert github.posted_comments == [], "예산 초과 notice 게시 X"
+    assert len(github.posted_reviews) == 1, "일반 review 경로 통과"
+    assert github.posted_reviews[0][1] is expected
 
 
 def test_use_case_does_not_fallback_when_only_filter_cut_changed_files(
@@ -417,6 +469,7 @@ def test_use_case_size_check_uses_full_prompt_not_just_diff_text(
         entries=(),
         total_chars=0,
         excluded=("a.py",),
+        budget_excluded=("a.py",),  # codex PR #26 review #6: budget cut 직접 명시
         exceeded_budget=True,
         budget=TokenBudget(500),
     )
@@ -471,6 +524,7 @@ def test_use_case_posts_notice_when_diff_itself_too_large(
         entries=(),
         total_chars=0,
         excluded=("big.py",),
+        budget_excluded=("big.py",),  # codex PR #26 review #6: budget cut 직접 명시
         exceeded_budget=True,
         budget=TokenBudget(100),  # 100 tokens × 4 chars = 400 char budget — diff 훨씬 큼
     )

@@ -147,19 +147,26 @@ class ReviewPullRequestUseCase:
 
 
 def _changed_missing(pr: PullRequest, dump: FileDump) -> bool:
-    """변경 파일 중 **예산 부족으로** 누락된 파일이 있는지 — fallback 발동의 진짜 트리거.
+    """변경 파일 중 **예산 cut** 으로 누락된 파일이 있는지 — fallback 트리거.
 
-    회귀 방지 (gemini PR #26 review #3): 이전엔 `cf not in entries` 만 검사해 의도된
-    필터 제외 파일 (binary, lock, image — 애초에 review 대상 아님) 도 "missing 신호" 로
-    카운트. 그 결과 이미지 1개만 변경된 PR 도 강제 fallback 으로 빠짐. 이제는 dump 가
-    `filtered_out` (의도된 제외) 와 `budget_excluded` (예산 cut) 를 분리 보고하므로,
-    필터 제외는 missing 판정에서 빼고 budget cut 만 트리거로 사용.
+    fallback 의 진짜 트리거는 단순함: "변경 파일이 budget_excluded 에 있는가". 직접
+    교집합 검사로 표현해 다른 누락 사유 (의도된 필터 제외, disk 에 없는 삭제 파일 등)
+    까지 잘못 카운트하던 회귀를 모두 한 번에 제거.
+
+    회귀 변천:
+    - 초기: `cf not in entries` — filter-cut 까지 missing 으로 오판 (이미지 PR 강제
+      fallback). gemini PR #26 review #3.
+    - round 4: `cf not in entries and cf not in filtered_out` — filter-cut 은 빠졌지만
+      삭제 파일도 missing 으로 오판 (체크아웃에 없으니 entries/filtered_out 어디에도
+      없음). codex PR #26 review #6.
+    - 현재: `cf in budget_excluded` 직접 검사 — 진짜 트리거 하나만 남김.
+
+    `budget_excluded` 에 들어가는 조건 (file_dump_collector): tracked 파일 중 filter
+    통과 + read 성공 했지만 char 한도로 잘려 나간 파일. 삭제 파일 (tracked 아님), 의도된
+    필터 제외 (filter 단계에서 분기), read 실패 (filtered_out 으로 분류) 모두 제외됨.
     """
-    included = {e.path for e in dump.entries}
-    filtered = set(dump.filtered_out)
-    return any(
-        cf not in included and cf not in filtered for cf in pr.changed_files
-    )
+    budget_cut = set(dump.budget_excluded)
+    return any(cf in budget_cut for cf in pr.changed_files)
 
 
 def _budget_exceeded_message(pr: PullRequest, dump: FileDump) -> str:
