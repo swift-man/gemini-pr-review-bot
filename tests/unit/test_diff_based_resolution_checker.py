@@ -578,6 +578,41 @@ def test_check_safely_handles_undecodable_bytes_in_source(
     assert fake.replies == [], "동일 치환 결과 비교 → 변경 없음 → reply 안 함 (그리고 예외 없음)"
 
 
+def test_check_skips_when_only_indentation_or_trailing_space_changes(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """들여쓰기 / trailing space 만 바뀐 라인은 reply 안 함 (formatter 자동 정리 noise 회피).
+
+    회귀 방지 (gemini PR #28 review #5): 정확 일치 비교는 black/prettier 같은 formatter
+    가 들여쓰기/공백을 자동 정리한 경우에도 reply 발동 → noise. strip 후 본문이 같으면
+    의미 있는 변경 아니므로 reply 안 함.
+    """
+    existing = (
+        _posted(
+            comment_id=8001,
+            commit_id="newshahead",
+            path="a.py",
+            line=10,
+            body="[Major] 잠재 버그",
+            original_commit_id="oldshaaa",
+            original_line=10,
+        ),
+    )
+    # 같은 본문 — formatter 가 들여쓰기 4칸 → 2칸으로 변경 + trailing space 정리.
+    # strip 결과는 동일.
+    _patch_git_show(monkeypatch, {
+        ("oldshaaa", "a.py"): "\n" * 9 + "    x = 1   \n",   # 4-space indent + trailing
+        ("newshahead", "a.py"): "\n" * 9 + "  x = 1\n",       # 2-space indent + cleaned
+    })
+
+    fake = _FakeGitHub(existing=existing)
+    DiffBasedResolutionChecker(fake).check_resolutions(_pr(), tmp_path)
+
+    assert fake.replies == [], (
+        "들여쓰기/trailing space 만 바뀐 라인은 reply 안 함 (formatter 자동 정리 noise 회피)"
+    )
+
+
 def test_check_reply_body_sha_matches_actually_read_sha_not_pr_head(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:

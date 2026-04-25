@@ -123,8 +123,12 @@ class DiffBasedResolutionChecker:
             # 한쪽이라도 못 읽으면 (commit unreachable, 파일 사라짐, 라인 범위 밖)
             # 비교 불가 → 안전한 skip. false reply 보다 reply 안 하는 게 나음.
             return
-        if prior_line == head_line:
-            # 라인 본문 변화 없음 → 메인테이너 처리 신호 X → reply 안 함
+        # 양끝 공백 strip 후 비교 (gemini PR #28 review #5): 들여쓰기/trailing space 만
+        # 바뀐 라인은 메인테이너 처리 신호 X — formatter 자동 정리 등으로 noise 만 됨.
+        # 진짜 본문이 바뀐 경우만 reply. strip 결과를 reply 본문엔 안 쓰고 비교만 — 본문
+        # 인용은 원본 그대로 유지해 메인테이너가 정확한 변화를 보도록.
+        if prior_line.strip() == head_line.strip():
+            # 본문 strip 결과가 같음 → 들여쓰기/trailing space 만 다름 → reply 안 함
             return
 
         # 본문/로그 SHA = head_line 을 실제 읽은 SHA (coderabbitai PR #28 review #4 +
