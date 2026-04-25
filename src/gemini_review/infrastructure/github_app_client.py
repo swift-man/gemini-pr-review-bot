@@ -153,7 +153,7 @@ class GitHubAppClient:
             initial_sha = str(pr_data["head"]["sha"])
 
             try:
-                changed, addable = self._fetch_files_for_pr(
+                changed, addable, patches = self._fetch_files_for_pr(
                     pr_url, token, initial_sha=initial_sha
                 )
             except _HeadShaChangedMidFetch as exc:
@@ -213,6 +213,7 @@ class GitHubAppClient:
                     installation_id=installation_id,
                     is_draft=bool(recheck.get("draft", False)),
                     addable_lines=tuple(addable),
+                    file_patches=tuple(patches),
                 )
 
             # 다음 iteration 은 이 recheck 결과를 시작점으로 — 여분의 /pulls 호출 회피.
@@ -255,12 +256,17 @@ class GitHubAppClient:
 
     def _fetch_files_for_pr(
         self, pr_url: str, token: str, *, initial_sha: str
-    ) -> tuple[list[str], list[tuple[str, frozenset[int]]]]:
-        """`/pulls/{n}/files` 를 페이지네이션 끝까지 돌며 (changed, addable) 한 쌍을 만든다.
+    ) -> tuple[
+        list[str],
+        list[tuple[str, frozenset[int]]],
+        list[tuple[str, str]],
+    ]:
+        """`/pulls/{n}/files` 를 페이지네이션 끝까지 돌며 (changed, addable, patches) 셋을 만든다.
 
-        한 호출로 두 가지를 동시 수집:
+        한 호출로 세 가지를 동시 수집:
           1) changed_files 목록 (file_collector 우선순위 정렬용)
           2) 각 파일의 patch → addable_lines 사전 파싱 (post_review 인라인 분할용)
+          3) raw patch text 보존 (예산 초과 시 diff-only fallback 리뷰의 입력)
         per_page=100 은 GitHub 허용 최대치라 PR 이 큰 경우의 라운드트립 수를 최소화.
 
         ### ABA race 방어 (codex PR #19 review #3 → #5 보강)
@@ -290,6 +296,7 @@ class GitHubAppClient:
         files_url = f"{pr_url}/files?per_page=100"
         changed: list[str] = []
         addable: list[tuple[str, frozenset[int]]] = []
+        patches: list[tuple[str, str]] = []
         page = 1
         while True:
             files = self._request_list("GET", f"{files_url}&page={page}", auth=f"token {token}")
@@ -312,15 +319,18 @@ class GitHubAppClient:
                 # 영역의 라인은 addable 로 분류되지 않아 인라인 가능했어도 본문 surface
                 # 로 내려간다. "인라인 손실 0" 보다 "잘못된 인라인 위치 안 만듦" 을 우선.
                 patch = file_entry.get("patch")
-                lines = addable_lines_from_patch(
-                    patch if isinstance(patch, str) else None
-                )
+                patch_text = patch if isinstance(patch, str) else None
+                lines = addable_lines_from_patch(patch_text)
                 addable.append((filename, frozenset(lines)))
+                # raw patch 보존 — diff-only fallback 리뷰의 입력. binary/삭제/truncate
+                # 처럼 patch 가 None 인 파일은 누락 (model 이 볼 게 없음).
+                if patch_text is not None:
+                    patches.append((filename, patch_text))
             # 100개 미만이면 마지막 페이지 — Link 헤더 대신 길이로 단순 판정.
             if len(files) < 100:
                 break
             page += 1
-        return changed, addable
+        return changed, addable, patches
 
     def post_review(self, pr: PullRequest, result: ReviewResult) -> None:
         if self._dry_run:

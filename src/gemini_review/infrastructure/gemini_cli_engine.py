@@ -7,7 +7,7 @@ from pathlib import Path
 from gemini_review.domain import FileDump, PullRequest, ReviewResult
 
 from .gemini_parser import parse_review
-from .gemini_prompt import build_prompt
+from .gemini_prompt import build_diff_prompt, build_prompt
 
 logger = logging.getLogger(__name__)
 
@@ -123,6 +123,48 @@ class GeminiCliEngine:
 
     def review(self, pr: PullRequest, dump: FileDump) -> ReviewResult:
         prompt = build_prompt(pr, dump)
+        return self._run_with_model_fallback(
+            pr=pr,
+            prompt=prompt,
+            invoke_log_kv={
+                "files": len(dump.entries),
+                "chars": dump.total_chars,
+                "mode": "full",
+            },
+        )
+
+    def review_diff(self, pr: PullRequest, diff_text: str) -> ReviewResult:
+        """전체 코드베이스 컨텍스트 한도 초과 시의 fallback — diff 만으로 리뷰 수행.
+
+        프롬프트가 모델에게 cross-file 단언 금지 + [Critical]/[Major] 등급 절제를
+        강하게 안내하므로, 같은 모델/타임아웃/fallback chain 정책을 그대로 재사용한다.
+        결과 ReviewResult 의 형식은 `review()` 와 동일 — 호출부 (use case) 가 같은
+        후처리 (verify, dedupe, post) 흐름을 적용 가능.
+        """
+        prompt = build_diff_prompt(pr, diff_text)
+        return self._run_with_model_fallback(
+            pr=pr,
+            prompt=prompt,
+            invoke_log_kv={
+                "diff_chars": len(diff_text),
+                "files": len(pr.file_patches),
+                "mode": "diff",
+            },
+        )
+
+    def _run_with_model_fallback(
+        self,
+        *,
+        pr: PullRequest,
+        prompt: str,
+        invoke_log_kv: dict[str, object],
+    ) -> ReviewResult:
+        """모델 fallback chain 으로 prompt 를 태우는 공유 루프.
+
+        review() / review_diff() 두 진입점이 같은 retryable 실패 정책 (timeout, empty
+        stdout, capacity/preview 실패 마커) 으로 fallback 모델을 순회하도록 한 곳에
+        모았다. invoke_log_kv 는 진단 로그용 모드별 메타.
+        """
         models = _dedupe_models(self._model, self._fallback_models)
         last_error = ""
         for index, model in enumerate(models):
@@ -133,7 +175,7 @@ class GeminiCliEngine:
             # 체인에 태운다. 이 블록을 _invoke_review 내부에서 RuntimeError 로 변환하면
             # 루프 자체를 빠져나가 fallback 이 발동하지 않는 회귀가 생긴다.
             try:
-                result = self._invoke_review(model, prompt, dump)
+                result = self._invoke_review(model, prompt, invoke_log_kv)
             except subprocess.TimeoutExpired:
                 if not has_fallback:
                     raise RuntimeError(
@@ -209,7 +251,7 @@ class GeminiCliEngine:
         self,
         model: str,
         prompt: str,
-        dump: FileDump,
+        log_kv: dict[str, object],
     ) -> subprocess.CompletedProcess[str]:
         # Gemini CLI 0.38.x 는 `-p/--prompt` 뒤에 문자열 인자를 요구한다. 실제 전체 레포
         # 프롬프트는 계속 stdin 으로 흘려 보내 ARG_MAX 를 피하고, argv 에는 non-empty
@@ -223,9 +265,8 @@ class GeminiCliEngine:
             _STDIN_PROMPT_PLACEHOLDER,
         ]
         logger.info(
-            "invoking gemini: files=%d chars=%d model=%s",
-            len(dump.entries),
-            dump.total_chars,
+            "invoking gemini: %s model=%s",
+            " ".join(f"{k}={v}" for k, v in log_kv.items()),
             model,
         )
         # TimeoutExpired 는 일부러 잡지 않고 그대로 propagate — caller 인 `review()` 가

@@ -267,3 +267,100 @@ def test_phantom_examples_use_unambiguous_wrong_vs_real_labels() -> None:
         f"❌ ({wrong_count}) 와 ✅ ({real_count}) 개수가 같아야 짝이 맞음 — 한쪽만 늘면"
         " phantom/real 짝짓기 해석이 깨진다"
     )
+
+
+# --- Diff fallback prompt (build_diff_prompt + assemble_pr_diff) -------------
+
+from gemini_review.infrastructure.gemini_prompt import (  # noqa: E402
+    DIFF_MODE_NOTICE,
+    assemble_pr_diff,
+    build_diff_prompt,
+)
+
+
+def _pr_with_patches(
+    *file_patches: tuple[str, str],
+) -> PullRequest:
+    return PullRequest(
+        repo=RepoRef("octo", "demo"),
+        number=7,
+        title="대형 PR",
+        body="본문",
+        head_sha="abc",
+        head_ref="feat",
+        base_sha="def",
+        base_ref="main",
+        clone_url="https://github.com/octo/demo.git",
+        changed_files=tuple(p for p, _ in file_patches),
+        installation_id=1,
+        is_draft=False,
+        file_patches=tuple(file_patches),
+    )
+
+
+def test_assemble_pr_diff_joins_file_patches_with_headers() -> None:
+    """`assemble_pr_diff` 가 PullRequest.file_patches 를 file 헤더 + annotated diff 로 join."""
+    patch_a = "@@ -1,1 +1,2 @@\n a\n+B\n"
+    patch_b = "@@ -10,1 +10,1 @@\n-old\n+new\n"
+    pr = _pr_with_patches(("a.py", patch_a), ("b.py", patch_b))
+
+    out = assemble_pr_diff(pr)
+
+    assert "--- FILE: a.py ---" in out
+    assert "--- FILE: b.py ---" in out
+    assert out.count("--- END FILE ---") == 2, "각 파일이 END FILE 로 닫혀야"
+    # annotated 라인 번호가 들어가야 (format_patch_with_line_numbers 통과 증거)
+    assert "      1|  a" in out and "      2| +B" in out
+    assert "     10| +new" in out
+
+
+def test_assemble_pr_diff_returns_empty_string_when_no_patches() -> None:
+    """file_patches 가 비었거나 모두 빈 patch 면 빈 문자열 — caller 가 fallback 포기 신호로 사용."""
+    pr = _pr_with_patches()
+    assert assemble_pr_diff(pr) == ""
+
+
+def test_build_diff_prompt_contains_diff_mode_notice_and_diff_section() -> None:
+    """diff prompt 는 DIFF_MODE_NOTICE + diff 본문 + JSON 출력 지시 모두 포함."""
+    diff_text = "--- FILE: a.py ---\n@@ -1,1 +1,2 @@\n      1|  a\n      2| +B\n--- END FILE ---"
+    pr = _pr_with_patches(("a.py", "@@ -1,1 +1,2 @@\n a\n+B\n"))
+
+    prompt = build_diff_prompt(pr, diff_text)
+
+    # 모드 notice — cross-file 단언 금지 / 차단 등급 절제 등 핵심 제약
+    assert "DIFF ONLY" in prompt or "diff 만" in prompt
+    assert "cross-file" in prompt or "[Critical]/[Major]" in prompt
+    # PR 메타데이터 (full prompt 와 동일 정보)
+    assert "octo/demo" in prompt
+    assert "head_sha: abc" in prompt
+    # diff 본문이 그대로 들어감
+    assert diff_text in prompt
+    # 출력 형식 지시 (SYSTEM_RULES 의 일부)
+    assert "JSON" in prompt
+    assert "comments" in prompt
+
+
+def test_build_diff_prompt_carries_phantom_whitespace_defenses() -> None:
+    """diff 모드도 동일한 환각 방어 규칙 (Phantom 공백, false CI failure) 을 모델에 전달.
+
+    회귀 방지: SYSTEM_RULES 가 빠지면 diff 모드 리뷰가 환각 방지 가이드 없이 작동.
+    """
+    pr = _pr_with_patches(("a.py", "@@ -1,1 +1,1 @@\n-x\n+y\n"))
+    prompt = build_diff_prompt(pr, "stub diff")
+
+    assert "Phantom 공백" in prompt or "phantom whitespace" in prompt.lower()
+    assert "command not found" in prompt
+
+
+def test_diff_mode_notice_is_a_separate_prominent_section() -> None:
+    """DIFF_MODE_NOTICE 가 단일 섹션 헤더로 prompt 에 명확히 노출.
+
+    회귀 방지: 모델이 fallback 모드임을 즉시 인지해야 cross-file 단언을 자제.
+    notice 섹션이 prompt 어딘가에 묻혀 있으면 효과 감소.
+    """
+    pr = _pr_with_patches(("a.py", "@@ -1,1 +1,1 @@\n-x\n+y\n"))
+    prompt = build_diff_prompt(pr, "stub")
+
+    assert DIFF_MODE_NOTICE.strip() in prompt, (
+        "notice block 전체가 prompt 에 그대로 포함돼야 (split/dilute 금지)"
+    )

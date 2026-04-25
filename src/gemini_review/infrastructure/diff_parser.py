@@ -57,3 +57,58 @@ def addable_lines_from_patch(patch: str | None) -> set[int]:
         # 그 외 (`-` 제거 라인, `\ No newline at end of file` 메타) 는 RIGHT 사이드에
         # 영향 없음 — 카운터를 옮기지 않고 통과.
     return addable
+
+
+def format_patch_with_line_numbers(patch: str | None) -> str:
+    """Patch 의 각 라인을 RIGHT-side 라인 번호로 annotate 한 사람·LLM 친화 포맷.
+
+    Diff-only fallback 리뷰에서 LLM 이 `comments[].line` 에 정확한 line 번호를 채워
+    넣을 수 있도록 hunk 헤더 + 본문 라인을 다음 형식으로 변환한다:
+
+        @@ -10,3 +10,5 @@ context-after-hunk
+            10|  context line (hunk 안의 unchanged)
+              | -removed line  (LEFT 만 존재 — RIGHT 라인 번호 없음)
+            11| +added line 1  (RIGHT, `+` 마커 보존)
+            12| +added line 2
+            13|  another context
+
+    형식 규칙:
+      - hunk 헤더 (`@@ ...`): 그대로 유지 + 줄바꿈
+      - context (` `) / 추가 (`+`) 라인: `  NNNNN| ` prefix + 원본 marker + 본문
+      - 제거 (`-`) 라인: `       | -본문` (5자 공백 + `|` — 정렬 위해)
+      - file 헤더 (`+++`/`---`) / `\\ No newline...` 같은 메타: 통과 (들여쓰기 없이)
+      - 빈 patch (None or "") → 빈 문자열 반환
+
+    회귀 방지: `addable_lines_from_patch` 와 같은 카운터 규칙 (`+`/` ` 만 RIGHT 라인
+    번호 진행, `-` 는 무시) 을 따라 두 함수가 같은 라인 집합을 produce. 한쪽만 잘못
+    수정되면 인라인 게시 (addable) 와 model 이 본 라인 번호 (formatted) 가 어긋남.
+    """
+    if not patch:
+        return ""
+    out: list[str] = []
+    new_line_no = 0
+    for line in patch.splitlines():
+        if line.startswith("@@"):
+            out.append(line)
+            match = _HUNK_HEADER.match(line)
+            if match:
+                # hunk 시작 직전 위치 — 첫 +/space 라인을 만나면 +1 되어 정확한 시작 번호.
+                new_line_no = int(match.group(1)) - 1
+            continue
+        if line.startswith("+++") or line.startswith("---"):
+            # diff 헤더 (file path) — 본문 아님. addable 계산과 동일한 우선 검사.
+            out.append(line)
+            continue
+        if line.startswith(("+", " ")):
+            new_line_no += 1
+            marker = line[:1]  # '+' or ' '
+            body = line[1:]
+            out.append(f"  {new_line_no:5d}| {marker}{body}")
+        elif line.startswith("-"):
+            # LEFT-only — RIGHT 에 존재 안 함. line 번호 자리는 공백.
+            body = line[1:]
+            out.append(f"       | -{body}")
+        else:
+            # `\ No newline at end of file` 같은 메타 라인 — 통과.
+            out.append(line)
+    return "\n".join(out)

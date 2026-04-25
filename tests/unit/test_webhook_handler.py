@@ -92,8 +92,16 @@ class FakeCollector:
 class FakeEngine:
     def __init__(self, result: ReviewResult) -> None:
         self._result = result
+        # diff fallback 진입 시 사용된 인자 기록 — 테스트 검증용
+        self.diff_calls: list[tuple[PullRequest, str]] = []
 
     def review(self, pr: PullRequest, dump: FileDump) -> ReviewResult:
+        return self._result
+
+    def review_diff(self, pr: PullRequest, diff_text: str) -> ReviewResult:
+        # diff fallback 흐름 테스트가 결과를 일반 review 와 구분할 수 있도록 새 객체로 반환.
+        # 호출 인자도 함께 기록해 fallback 진입 자체와 입력 내용을 검증 가능.
+        self.diff_calls.append((pr, diff_text))
         return self._result
 
 
@@ -234,9 +242,16 @@ def test_accept_ignores_unsupported_action(tmp_path: Path) -> None:
     assert code == 202
 
 
-def test_use_case_posts_comment_when_budget_exceeded(tmp_path: Path) -> None:
+def test_use_case_posts_comment_when_budget_exceeded_and_no_diff_available(
+    tmp_path: Path,
+) -> None:
+    """예산 초과 + 변경 파일이 binary/truncate 라 patch 가 없으면 → notice 게시.
+
+    회귀 방지: diff fallback 이 도입돼도 patch 가 없는 경우는 그대로 notice 경로 유지.
+    `_sample_pr()` 가 `file_patches=()` 라 fallback 이 빈 diff 를 반환 → notice fall-through.
+    """
     github = FakeGitHub()
-    pr = _sample_pr()
+    pr = _sample_pr()  # file_patches=() default
     dump = FileDump(
         entries=(),
         total_chars=0,
@@ -256,6 +271,112 @@ def test_use_case_posts_comment_when_budget_exceeded(tmp_path: Path) -> None:
 
     use_case.execute(pr)
 
+    assert github.posted_reviews == []
+    assert len(github.posted_comments) == 1
+    assert "예산 초과" in github.posted_comments[0][1]
+
+
+def test_use_case_falls_back_to_diff_review_when_budget_exceeded_with_patches(
+    tmp_path: Path,
+) -> None:
+    """예산 초과 + 변경 파일 patch 존재 → diff fallback 으로 리뷰 수행 + post_review 게시.
+
+    핵심 회귀 방지 (사용자 신고): 큰 저장소에서 GEMINI_MAX_INPUT_TOKENS 초과 시 이전엔
+    리뷰 자체를 skip 하고 notice 만 남겼는데, 이제는 diff 만으로라도 리뷰를 수행해
+    "0건" 보다 "narrower 리뷰" 를 사용자에게 제공.
+    """
+    github = FakeGitHub()
+    pr = PullRequest(
+        repo=RepoRef("o", "r"),
+        number=42,
+        title="대형 PR",
+        body="",
+        head_sha="abc",
+        head_ref="feat",
+        base_sha="def",
+        base_ref="main",
+        clone_url="https://example/x.git",
+        changed_files=("a.py",),
+        installation_id=7,
+        is_draft=False,
+        file_patches=(("a.py", "@@ -1,1 +1,2 @@\n a\n+B\n"),),
+    )
+    dump = FileDump(
+        entries=(),
+        total_chars=0,
+        excluded=("a.py",),
+        exceeded_budget=True,
+        budget=TokenBudget(1000),  # diff 1줄은 여유롭게 통과
+    )
+    expected = ReviewResult(summary="diff-review", event=ReviewEvent.COMMENT)
+    engine = FakeEngine(expected)
+    use_case = ReviewPullRequestUseCase(
+        github=github,
+        repo_fetcher=FakeFetcher(tmp_path),
+        file_collector=FakeCollector(dump),
+        engine=engine,
+        finding_verifier=FakeFindingVerifier(),
+        finding_deduper=FakeFindingDeduper(),
+        max_input_tokens=1000,
+    )
+
+    use_case.execute(pr)
+
+    assert len(engine.diff_calls) == 1, "engine.review_diff 가 호출돼야"
+    assert engine.diff_calls[0][0] is pr
+    assert "a.py" in engine.diff_calls[0][1], "diff_text 에 변경 파일 경로 포함돼야"
+    assert "+B" in engine.diff_calls[0][1], "diff_text 에 추가 라인 포함돼야"
+    assert github.posted_comments == [], "diff fallback 에선 notice 게시 안 함"
+    assert len(github.posted_reviews) == 1
+    assert github.posted_reviews[0][1] is expected, "diff review 결과가 그대로 게시돼야"
+
+
+def test_use_case_posts_notice_when_diff_itself_too_large(
+    tmp_path: Path,
+) -> None:
+    """예산 초과 + diff 도 budget 초과 → notice (engine 호출 안 함, rate-limit 절감).
+
+    회귀 방지: diff fallback 이 무조건 시도되면 거대 patch 가 들어오는 PR 에서 모델
+    호출이 100% 실패. 게시 가치 없는 호출은 사전 차단해 GEMINI 호출 비용 + 시간 절감.
+    """
+    github = FakeGitHub()
+    huge_patch = "@@ -1,1 +1,1 @@\n" + ("+x\n" * 5000)  # 약 15000 chars
+    pr = PullRequest(
+        repo=RepoRef("o", "r"),
+        number=42,
+        title="대형 PR",
+        body="",
+        head_sha="abc",
+        head_ref="feat",
+        base_sha="def",
+        base_ref="main",
+        clone_url="https://example/x.git",
+        changed_files=("big.py",),
+        installation_id=7,
+        is_draft=False,
+        file_patches=(("big.py", huge_patch),),
+    )
+    dump = FileDump(
+        entries=(),
+        total_chars=0,
+        excluded=("big.py",),
+        exceeded_budget=True,
+        budget=TokenBudget(100),  # 100 tokens × 4 chars = 400 char budget — diff 훨씬 큼
+    )
+    engine = FakeEngine(ReviewResult(summary="x", event=ReviewEvent.COMMENT))
+    use_case = ReviewPullRequestUseCase(
+        github=github,
+        repo_fetcher=FakeFetcher(tmp_path),
+        file_collector=FakeCollector(dump),
+        engine=engine,
+        finding_verifier=FakeFindingVerifier(),
+        finding_deduper=FakeFindingDeduper(),
+        max_input_tokens=100,
+    )
+
+    use_case.execute(pr)
+
+    assert engine.diff_calls == [], "diff 가 너무 커서 engine 호출 안 함"
     assert github.posted_reviews == []
     assert len(github.posted_comments) == 1
     assert "예산 초과" in github.posted_comments[0][1]

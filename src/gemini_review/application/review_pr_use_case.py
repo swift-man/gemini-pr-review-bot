@@ -1,6 +1,7 @@
 import logging
 
-from gemini_review.domain import FileDump, PullRequest, TokenBudget
+from gemini_review.domain import FileDump, PullRequest, ReviewResult, TokenBudget
+from gemini_review.infrastructure.gemini_prompt import assemble_pr_diff
 from gemini_review.interfaces import (
     FileCollector,
     FindingDeduper,
@@ -11,6 +12,10 @@ from gemini_review.interfaces import (
 )
 
 logger = logging.getLogger(__name__)
+
+# 1 token ≈ 4 chars 보수 추정. diff 도 너무 커서 모델이 못 받으면 fallback notice 로 대체.
+# `dump.collect()` 에서 쓰는 동일 비율을 참조 — 별도 비율을 두면 두 곳이 어긋날 위험.
+_CHARS_PER_TOKEN = 4
 
 
 class ReviewPullRequestUseCase:
@@ -43,27 +48,30 @@ class ReviewPullRequestUseCase:
 
         dump = self._file_collector.collect(repo_path, pr.changed_files, self._budget)
 
-        # 변경 파일이 예산 때문에 잘려 나갔다면 "전체 리뷰"가 성립하지 않는다. 저품질 리뷰를
-        # 게시하느니 리뷰를 건너뛰고 운영자에게 조치 방법을 안내 코멘트로 남긴다.
-        # 변경 파일이 모두 들어간 경우(잘려도 비변경 파일만 제외)는 그대로 리뷰를 수행한다.
+        # 변경 파일이 예산 때문에 잘려 나갔다면 "전체 리뷰"는 성립하지 않는다. 그래도 리뷰를
+        # 완전히 건너뛰는 대신 **diff-only fallback** 으로 우회 시도. PR 전체 코드베이스가 모델
+        # 컨텍스트를 초과하는 큰 저장소도 변경 라인 자체는 거의 항상 모델 한도 안에 들어오므로,
+        # "리뷰 0건" 보다 "diff 만 본 narrower 리뷰" 가 사용자 가치 큼.
+        #
+        # 우선순위:
+        #   1) 일반 모드 (변경 파일 모두 dump 에 들어감) — `engine.review(pr, dump)`
+        #   2) diff fallback (변경 파일이 잘려 나감 + diff 가 비어 있지 않고 budget 안) —
+        #      `engine.review_diff(pr, diff_text)`
+        #   3) notice (diff 도 비었거나 너무 큼) — `_budget_exceeded_message`
         if dump.exceeded_budget and _changed_missing(pr, dump):
-            logger.warning(
-                "budget exceeded for %s#%d — skipping review, posting notice",
+            result = self._fallback_to_diff_review(pr, dump)
+            if result is None:
+                return
+        else:
+            logger.info(
+                "reviewing %s#%d — files=%d chars=%d excluded=%d",
                 pr.repo.full_name,
                 pr.number,
+                len(dump.entries),
+                dump.total_chars,
+                len(dump.excluded),
             )
-            self._github.post_comment(pr, _budget_exceeded_message(pr, dump))
-            return
-
-        logger.info(
-            "reviewing %s#%d — files=%d chars=%d excluded=%d",
-            pr.repo.full_name,
-            pr.number,
-            len(dump.entries),
-            dump.total_chars,
-            len(dump.excluded),
-        )
-        result = self._engine.review(pr, dump)
+            result = self._engine.review(pr, dump)
         # Layer B — 출처 grounding: 모델이 본문에 인용한 텍스트가 실제 소스 라인에 존재
         # 하는지 디스크 레벨로 확인. phantom quote 환각 (예: 모델이 `"@scope"` 를
         # `" @scope"` 로 잘못 토큰화 → "원본에 공백" 단언) 을 [Suggestion] 으로 강등.
@@ -73,6 +81,60 @@ class ReviewPullRequestUseCase:
         # 으로 강등. 4 회 연속 push 동일 phantom 코멘트 같은 alert fatigue 방어.
         result = self._finding_deduper.dedupe(result, pr)
         self._github.post_review(pr, result)
+
+
+    def _fallback_to_diff_review(
+        self,
+        pr: PullRequest,
+        dump: FileDump,
+    ) -> ReviewResult | None:
+        """전체 dump 가 예산 초과로 변경 파일을 다 못 담을 때의 우회 경로.
+
+        Returns:
+            성공 시 ReviewResult (caller 가 verify/dedupe/post 흐름으로 진행).
+            None 이면 fallback 도 불가 → caller 는 일찍 return (notice 는 본 함수가
+            이미 게시).
+
+        ### 의도된 graceful degrade
+
+        - diff 가 비었거나 (`assemble_pr_diff` 가 모두 binary/truncate 라 None 반환):
+          애초에 모델이 볼 게 없음 → 기존 notice.
+        - diff 가 있지만 char 추정 token 수가 max_input_tokens 초과: 모델이 거부할
+          가능성 큼 → notice (engine 호출은 비용·noise). 이 임계는 휴리스틱이라
+          미세 오차는 receive — 보수적이라 false-skip 쪽이 false-attempt 보다 안전.
+        """
+        diff_text = assemble_pr_diff(pr)
+        if not diff_text:
+            logger.warning(
+                "budget exceeded for %s#%d and no diff available — posting notice",
+                pr.repo.full_name,
+                pr.number,
+            )
+            self._github.post_comment(pr, _budget_exceeded_message(pr, dump))
+            return None
+
+        max_chars = self._budget.max_tokens * _CHARS_PER_TOKEN
+        if len(diff_text) > max_chars:
+            logger.warning(
+                "budget exceeded for %s#%d and diff also too large "
+                "(diff_chars=%d > max_chars=%d) — posting notice",
+                pr.repo.full_name,
+                pr.number,
+                len(diff_text),
+                max_chars,
+            )
+            self._github.post_comment(pr, _budget_exceeded_message(pr, dump))
+            return None
+
+        logger.warning(
+            "budget exceeded for %s#%d — falling back to diff-only review "
+            "(diff_chars=%d, file_patches=%d)",
+            pr.repo.full_name,
+            pr.number,
+            len(diff_text),
+            len(pr.file_patches),
+        )
+        return self._engine.review_diff(pr, diff_text)
 
 
 def _changed_missing(pr: PullRequest, dump: FileDump) -> bool:
