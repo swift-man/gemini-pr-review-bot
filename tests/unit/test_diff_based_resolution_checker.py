@@ -526,6 +526,97 @@ def test_check_graceful_degrade_on_per_reply_failure_continues(
 # --- Empty / no-op cases ------------------------------------------------------
 
 
+def test_check_safely_handles_undecodable_bytes_in_source(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """git show 응답에 UTF-8 디코딩 불가 바이트가 있어도 Layer E 가 터지면 안 됨.
+
+    회귀 방지 (gemini PR #28 review #2): subprocess `text=True` + 명시 encoding 없음 →
+    바이너리/non-UTF8 파일에서 UnicodeDecodeError (ValueError 하위). 우리 except 블록은
+    OSError/SubprocessError 만 잡아 전체 후속 검사가 비정상 종료. 이제는
+    `errors="replace"` 로 안전 디코딩.
+
+    이 테스트는 git show 가 invalid 바이트를 stdout 으로 돌려주는 시나리오를 모사 — 실
+    환경에선 subprocess 가 디코딩하지만 fake_run 에서 직접 replace 결과를 시뮬.
+    """
+
+    class _FakeCompleted:
+        def __init__(self, returncode: int, stdout: str = "") -> None:
+            self.returncode = returncode
+            self.stdout = stdout
+
+    def fake_run(cmd: list[str], **kwargs: object) -> _FakeCompleted:
+        # `errors="replace"` 가 정확히 전달됐는지 확인 — 누락되면 이 테스트는 통과
+        # 하더라도 production 환경에서 회귀 가능
+        assert kwargs.get("encoding") == "utf-8", "encoding=utf-8 명시 필요"
+        assert kwargs.get("errors") == "replace", "errors=replace 명시 필요"
+        spec = cmd[-1]
+        sha, _, _ = spec.partition(":")
+        # 양쪽 sha 모두 invalid byte 가 replace 된 결과 시뮬 (실 환경에서 errors=replace
+        # 가 � 로 치환). 두 sha 의 같은 라인 모두 동일 치환 결과 → no diff → no reply.
+        if sha == "oldshaaa":
+            return _FakeCompleted(0, "\n" * 9 + "x = ��\n")
+        return _FakeCompleted(0, "\n" * 9 + "x = ��\n")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    existing = (
+        _posted(
+            comment_id=5001,
+            commit_id="newshahead",
+            path="bin.dat",
+            line=10,
+            body="[Major] 바이너리 파일 지적",
+            original_commit_id="oldshaaa",
+            original_line=10,
+        ),
+    )
+
+    fake = _FakeGitHub(existing=existing)
+    # 예외 없이 정상 흐름으로 끝나야
+    DiffBasedResolutionChecker(fake).check_resolutions(_pr(), tmp_path)
+    assert fake.replies == [], "동일 치환 결과 비교 → 변경 없음 → reply 안 함 (그리고 예외 없음)"
+
+
+def test_check_renders_line_content_in_code_block_safe_to_backticks(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """라인 본문에 backtick 이 포함돼도 markdown 깨지지 않게 4-space indent 코드 블록으로 렌더.
+
+    회귀 방지 (gemini PR #28 review #4): inline backtick (`` `{line}` ``) 로 감싸면
+    line 에 backtick 이 있을 때 마크다운 깨짐. 4-space indent code block 은 fence 와
+    무관해 어떤 backtick 개수의 본문도 그대로 표시.
+    """
+    existing = (
+        _posted(
+            comment_id=6001,
+            commit_id="newshahead",
+            path="README.md",
+            line=10,
+            body="[Major] 마크다운 docstring 지적",
+            original_commit_id="oldshaaa",
+            original_line=10,
+        ),
+    )
+    # 양쪽 모두 backtick 포함된 라인 (마크다운 / docstring 흔한 케이스)
+    _patch_git_show(monkeypatch, {
+        ("oldshaaa", "README.md"): "\n" * 9 + "use `legacy_api()`\n",
+        ("newshahead", "README.md"): "\n" * 9 + "use `new_api()` instead\n",
+    })
+
+    fake = _FakeGitHub(existing=existing)
+    DiffBasedResolutionChecker(fake).check_resolutions(_pr(), tmp_path)
+
+    assert len(fake.replies) == 1
+    body = fake.replies[0][2]
+    # inline backtick 으로 라인을 감싸지 않아야 — 4-space indent 형태로 렌더
+    assert "    use `legacy_api()`" in body, "이전 라인은 4-space indent 로 렌더"
+    assert "    use `new_api()` instead" in body, "현재 라인은 4-space indent 로 렌더"
+    # `**이전:** \`use \`legacy_api()\`\`` 같은 inline backtick wrapping 이 없어야
+    assert "**이전:** `use" not in body, "inline backtick wrapping 회귀 X"
+    assert "**현재:** `use" not in body
+
+
 def test_check_no_op_when_no_prior_comments(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:

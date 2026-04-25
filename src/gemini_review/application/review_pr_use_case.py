@@ -18,7 +18,8 @@ logger = logging.getLogger(__name__)
 class ReviewPullRequestUseCase:
     """리뷰 파이프라인 오케스트레이션.
 
-    PR 조회 → 체크아웃 → 파일 수집 → 리뷰 → 출처 검증 → 이전 push dedup → 게시.
+    PR 조회 → 체크아웃 → 파일 수집 → 리뷰 → 출처 검증 (Layer B) → 이전 push dedup
+    (Layer D) → 게시 → 후속 수정 추적 (Layer E, finally 보장).
     """
 
     def __init__(

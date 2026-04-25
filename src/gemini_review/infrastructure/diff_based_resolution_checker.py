@@ -166,12 +166,19 @@ def _read_line_at_commit(
     - 파일이 그 commit 에 없음 (해당 push 에서 이름이 달랐음 등)
     - 라인 번호가 그 commit 의 파일 크기 범위 밖
     - subprocess 실패 (timeout, OSError 등)
+    - 디코딩 실패 — `errors="replace"` 로 복구 (gemini PR #28 review #2): UTF-8 로
+      디코딩 불가능한 바이너리 파일이나 다른 인코딩의 텍스트가 들어와도
+      `UnicodeDecodeError` (ValueError 하위) 로 Layer E 전체가 터지면 안 됨.
+      대체 문자(�) 로 디코딩한 결과를 그대로 비교 — 두 commit 의 같은 라인이라면
+      대체 결과도 같아 비교는 의미 있는 결과를 낸다.
     """
     try:
         result = subprocess.run(  # noqa: S603
             ["git", "-C", str(repo_root), "show", f"{commit_sha}:{path}"],
             capture_output=True,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             timeout=10,
         )
     except (subprocess.SubprocessError, OSError):
@@ -192,10 +199,24 @@ def _build_resolution_reply(
     "✅ 해결됨" 같은 confident 표기는 의도적으로 회피. 라인이 바뀐 것은 사실이지만
     원래 finding 의 의도와 일치하는 수정인지는 메인테이너가 판단해야 함. 대댓글이
     "확인 부탁드립니다" 톤으로 끝나는 게 v1 의 design contract.
+
+    ### 라인 본문 렌더링 — 4-space indent 코드 블록 (gemini PR #28 review #4)
+
+    inline backtick (`` `{line}` ``) 으로 감싸면 라인 본문에 backtick 이 포함된 경우
+    (예: 마크다운 파일, 백틱 사용한 docstring 등) markdown 이 깨짐. 4-space indent
+    code block 은 fence 와 무관하게 안전하고 어떤 backtick 개수의 본문도 그대로 표시.
     """
     return (
         f"📌 라인이 변경되었습니다 (`{prior_sha[:7]}` → `{head_sha[:7]}`).\n\n"
-        f"**이전:** `{prior_line}`\n"
-        f"**현재:** `{head_line}`\n\n"
+        f"**이전:**\n\n{_indent_code(prior_line)}\n\n"
+        f"**현재:**\n\n{_indent_code(head_line)}\n\n"
         "의도된 수정인지 — 원래 지적의 의도와 일치하는지 확인 부탁드립니다."
     )
+
+
+def _indent_code(line: str) -> str:
+    """라인 본문을 4-space indent code block 으로 감싸 markdown safe 하게 렌더.
+
+    빈 라인은 빈 indent 줄 하나로 보존 — markdown 렌더러가 코드 블록을 깨뜨리지 않도록.
+    """
+    return "    " + line if line else "    "
