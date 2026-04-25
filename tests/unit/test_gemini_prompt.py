@@ -320,6 +320,30 @@ def test_assemble_pr_diff_returns_empty_string_when_no_patches() -> None:
     assert assemble_pr_diff(pr) == ""
 
 
+def test_assemble_pr_diff_excludes_deleted_only_patches() -> None:
+    """삭제-only patch (전체 파일 삭제 등 RIGHT 라인 0) 는 fallback 입력에서 제외.
+
+    회귀 방지 (codex PR #26 review #2): `-` 라인만 있는 patch 는 RIGHT 사이드에 인라인
+    코멘트를 달 수 없는데 모델 입력에 포함되면 RIGHT 에 없는 내용을 잘못 단언할 risk
+    만 늘어남. PR METADATA 섹션이 "어떤 파일이 변경됐다" 큰 그림은 그대로 노출하므로
+    diff fallback 입력에서만 제외해도 정보 손실 없음.
+    """
+    deleted_only_patch = "@@ -1,3 +0,0 @@\n-old line 1\n-old line 2\n-old line 3\n"
+    normal_patch = "@@ -1,1 +1,2 @@\n a\n+B\n"
+    pr = _pr_with_patches(
+        ("removed.py", deleted_only_patch),
+        ("kept.py", normal_patch),
+    )
+
+    out = assemble_pr_diff(pr)
+
+    assert "--- FILE: removed.py ---" not in out, (
+        "삭제-only patch 는 RIGHT 인라인 불가 → diff fallback 에서 제외"
+    )
+    assert "--- FILE: kept.py ---" in out, "RIGHT 라인이 있는 patch 는 정상 포함"
+    assert out.count("--- END FILE ---") == 1, "kept.py 한 블록만 있어야"
+
+
 def test_build_diff_prompt_contains_diff_mode_notice_and_diff_section() -> None:
     """diff prompt 는 DIFF_MODE_NOTICE + diff 본문 + JSON 출력 지시 모두 포함."""
     diff_text = "--- FILE: a.py ---\n@@ -1,1 +1,2 @@\n      1|  a\n      2| +B\n--- END FILE ---"

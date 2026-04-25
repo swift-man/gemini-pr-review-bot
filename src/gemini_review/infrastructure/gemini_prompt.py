@@ -1,6 +1,6 @@
 from gemini_review.domain import FileDump, FileEntry, PullRequest
 
-from .diff_parser import format_patch_with_line_numbers
+from .diff_parser import addable_lines_from_patch, format_patch_with_line_numbers
 
 SYSTEM_RULES = """\
 당신은 숙련된 시니어 개발자이며 GitHub Pull Request의 **전체 코드베이스**를 한국어로 리뷰하는 봇입니다.
@@ -342,9 +342,21 @@ def assemble_pr_diff(pr: PullRequest) -> str:
     각 파일을 `--- FILE: path ---` 헤더 + RIGHT-annotated patch + `--- END FILE ---`
     로 감싸서 join. 파일이 0 개거나 모든 patch 가 binary/truncate 로 None 이었으면
     빈 문자열 반환 — caller 가 빈 결과를 보고 fallback 을 포기해야 한다.
+
+    ### 삭제-only patch 제외 (codex PR #26 review #2)
+
+    `addable_lines_from_patch` 가 빈 set 을 돌려주는 patch (= RIGHT 라인이 하나도 없는
+    경우 — 전체 파일 삭제 등) 는 fallback 입력에서 제외한다. 모델이 review 해도
+    `(path, line)` 인라인 게시 불가하고, RIGHT 에 없는 내용을 phantom 단언할 risk 만
+    늘어남. PR description / 변경 파일 목록은 prompt 의 PR METADATA 섹션에 그대로
+    있어 "어떤 파일이 삭제됐다" 라는 큰 그림 정보는 보존됨.
     """
     blocks: list[str] = []
     for path, patch in pr.file_patches:
+        # 삭제-only patch 는 RIGHT 인라인 코멘트 불가 → diff fallback 에서 제외.
+        # `addable_lines_from_patch` 와 같은 카운터 규칙으로 판정 일관성 보장.
+        if not addable_lines_from_patch(patch):
+            continue
         annotated = format_patch_with_line_numbers(patch)
         if not annotated:
             continue
