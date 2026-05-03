@@ -1813,3 +1813,32 @@ def test_fetch_pr_conversation_sort_pushes_missing_timestamps_to_end(
     assert bodies_in_order == ["정상 timestamp", "더 최근 timestamp", "결손 timestamp"], (
         f"빈 timestamp 는 끝으로 정렬돼야. 실제 순서: {bodies_in_order}"
     )
+
+
+def test_http_converts_json_decode_error_to_runtime_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """200 OK + invalid JSON 본문은 RuntimeError 로 변환돼 호출부의 graceful degrade 그물에 잡혀야 한다.
+
+    회귀 방지 (gemini PR #29 review #2): 프록시 (Cloudflare 등) 가 5xx HTML 페이지를
+    200 으로 가로채는 경우, 또는 GitHub 가 잘못된 응답을 보낸 희소 사례. 이전 구현은
+    `json.loads` 의 `JSONDecodeError` (ValueError 하위) 가 호출부의 `(HTTPError,
+    URLError, RuntimeError)` except 에 안 잡혀 파이프라인 크래시. RuntimeError 변환으로
+    fetch_pr_conversation / execute() 의 graceful degrade 경로에 정상 흡수.
+    """
+
+    def fake_urlopen(
+        req: urllib.request.Request,
+        *,
+        timeout: float | None = None,
+        context: ssl.SSLContext | None = None,
+    ) -> _FakeResponse:
+        # 200 OK + non-JSON HTML body (proxy error page 시뮬)
+        return _FakeResponse(b"<html><body>502 Bad Gateway</body></html>")
+
+    monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+    monkeypatch.setattr(jwt, "encode", lambda *a, **k: "fake.jwt")
+
+    client = GitHubAppClient(app_id=1, private_key_pem="-")
+    with pytest.raises(RuntimeError, match="invalid JSON"):
+        client._http("GET", "https://api.github.com/x", auth="token t")

@@ -666,7 +666,7 @@ class GitHubAppClient:
         req = urllib.request.Request(url, data=data, method=method, headers=headers)
         try:
             with urllib.request.urlopen(req, timeout=30, context=self._tls_context) as resp:  # noqa: S310
-                return json.loads(resp.read().decode("utf-8") or "{}")
+                raw = resp.read().decode("utf-8") or "{}"
         except urllib.error.HTTPError as exc:
             # `exc.read()` 는 1회용 stream — 여기서 읽고 나면 호출부가 다시 못 읽는다.
             # 호출부가 422 의 구체 사유(예: "line must be part of the diff" vs 다른 검증
@@ -676,6 +676,24 @@ class GitHubAppClient:
             exc.gemini_review_detail = detail  # type: ignore[attr-defined]
             logger.error("GitHub %s %s failed: %s %s", method, url, exc.code, detail[:500])
             raise
+
+        # 200 OK 본문이라도 JSON 형식이 망가졌을 수 있다 (gemini PR #29 review #2):
+        # 프록시 (Cloudflare 등) 가 5xx HTML 페이지를 200 으로 가로채는 케이스, 또는
+        # GitHub 가 잘못된 응답을 보낸 희소 사례. `json.loads` 의 `JSONDecodeError` 는
+        # `ValueError` 하위라 호출부의 `(HTTPError, URLError, RuntimeError)` 그물에
+        # 안 잡혀 파이프라인 크래시 가능. 명시적 `RuntimeError` 변환으로 graceful degrade
+        # 경로에 흡수되도록.
+        try:
+            return json.loads(raw)
+        except json.JSONDecodeError as exc:
+            logger.error(
+                "GitHub %s %s returned 200 but body is not valid JSON: %s "
+                "(body_preview=%r)",
+                method, url, exc, raw[:200],
+            )
+            raise RuntimeError(
+                f"invalid JSON in 200 response from {method} {url}: {exc}"
+            ) from exc
 
 
 def _resolve_fetch_source(
