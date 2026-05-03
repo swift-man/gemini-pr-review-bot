@@ -1,4 +1,5 @@
 import logging
+import urllib.error
 
 from gemini_review.domain import (
     FileDump,
@@ -62,9 +63,14 @@ class ReviewPullRequestUseCase:
         #
         # graceful degrade: fetch 실패 시 빈 PrConversation 으로 fall-back — 컨텍스트만
         # 잠시 못 보여줄 뿐 리뷰는 정상 진행 (Layer F 의 도메인 contract 와 일관).
+        # 예상 가능한 통신/응답 형식 오류만 graceful degrade — 매핑/로직 버그
+        # (TypeError, KeyError 등) 는 통과시켜 회귀를 silently 숨기지 않도록
+        # (coderabbit PR #29 review #4). HTTPError/URLError 는 GitHubAppClient 의
+        # `_http` 가 raise 하는 통신 오류, RuntimeError 는 `_request_list` 의 응답 형식
+        # 오류 (배열 아님 등). 이외 예외는 진짜 결함이라 propagate 가 맞음.
         try:
             conversation = self._github.fetch_pr_conversation(pr)
-        except Exception as exc:  # noqa: BLE001 — graceful degrade
+        except (urllib.error.HTTPError, urllib.error.URLError, RuntimeError) as exc:
             logger.warning(
                 "fetch_pr_conversation failed for %s#%d (%s); proceeding without "
                 "conversation context",
@@ -166,7 +172,11 @@ class ReviewPullRequestUseCase:
 
         # 실제 모델 입력 = build_diff_prompt 결과. diff_text 만 검사하면 SYSTEM_RULES +
         # DIFF_MODE_NOTICE + PR 메타 overhead 로 한도 초과 가능 (codex PR #26 review #1).
-        prompt_chars = len(build_diff_prompt(pr, diff_text))
+        # 실제 모델 입력은 conversation 까지 포함된 prompt — budget check 도 같은
+        # 입력으로 검사 (codex/coderabbit PR #29 review #2): 이전엔 conversation 빠진
+        # prompt 길이만 검사 → conversation 이 큰 PR 에서 fits() 통과해도 실제
+        # `engine.review_diff(..., conversation=...)` 입력이 한도 초과 가능.
+        prompt_chars = len(build_diff_prompt(pr, diff_text, conversation=conversation))
         if not self._budget.fits(prompt_chars):
             logger.warning(
                 "budget exceeded for %s#%d and diff prompt also too large "

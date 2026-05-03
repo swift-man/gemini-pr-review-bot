@@ -13,6 +13,7 @@ import pytest
 from gemini_review.application.review_pr_use_case import ReviewPullRequestUseCase
 from gemini_review.application.webhook_handler import WebhookHandler
 from gemini_review.domain import (
+    ConversationEntry,
     FileDump,
     FileEntry,
     PostedReviewComment,
@@ -746,6 +747,84 @@ def test_use_case_fetches_pr_conversation_and_passes_to_engine(
     received = engine.review_conversations[0]
     assert received is not None and len(received.entries) == 1
     assert received.entries[0].body == "이전 라운드 의견"
+
+
+def test_use_case_diff_fallback_budget_check_includes_conversation(
+    tmp_path: Path,
+) -> None:
+    """diff fallback budget check 가 conversation 포함된 prompt 길이로 검사돼야.
+
+    회귀 방지 (codex/coderabbit PR #29 review #2): 이전 구현은 `len(build_diff_prompt(
+    pr, diff_text))` (conversation 누락) 만 검사 → conversation 이 큰 PR 에서 fits()
+    통과해도 실제 모델 입력은 한도 초과. budget 검사도 실제 호출과 같은 입력으로 해야.
+
+    이 테스트: budget 이 빠듯해서 diff_text + SYSTEM_RULES 는 fit 하지만 conversation 까지
+    더하면 초과되는 경계 → fallback 시도 X, notice 게시.
+    """
+    # 큰 conversation 엔트리 (~5KB body)
+    big_conv = PrConversation(entries=(
+        ConversationEntry(
+            kind="review",
+            author_login="other-bot[bot]",
+            is_bot=True,
+            is_pr_author=False,
+            submitted_at="2026-04-26T10:00:00Z",
+            body="X" * 5000,
+            state="COMMENTED",
+        ),
+    ))
+
+    class _ConvGitHub(FakeGitHub):
+        def fetch_pr_conversation(self, pr: PullRequest) -> PrConversation:
+            return big_conv
+
+    github = _ConvGitHub()
+    pr = PullRequest(
+        repo=RepoRef("o", "r"),
+        number=42,
+        title="대형 PR",
+        body="",
+        head_sha="abc",
+        head_ref="feat",
+        base_sha="def",
+        base_ref="main",
+        clone_url="https://example/x.git",
+        changed_files=("a.py",),
+        installation_id=7,
+        is_draft=False,
+        file_patches=(("a.py", "@@ -1,1 +1,2 @@\n a\n+B\n"),),
+        addable_lines=(("a.py", frozenset({1, 2})),),
+    )
+    # 예산 ~7KB chars: SYSTEM_RULES (~5KB) + conversation (~5KB) + 작은 diff = > 7KB
+    # → conversation 포함 prompt 는 cap 초과 → notice
+    dump = FileDump(
+        entries=(),
+        total_chars=0,
+        excluded=("a.py",),
+        budget_excluded=("a.py",),
+        exceeded_budget=True,
+        budget=TokenBudget(1750),  # 1750 tokens × 4 chars = 7000 char budget
+    )
+    engine = FakeEngine(ReviewResult(summary="x", event=ReviewEvent.COMMENT))
+    use_case = ReviewPullRequestUseCase(
+        github=github,
+        repo_fetcher=FakeFetcher(tmp_path),
+        file_collector=FakeCollector(dump),
+        engine=engine,
+        finding_verifier=FakeFindingVerifier(),
+        finding_deduper=FakeFindingDeduper(),
+        resolution_checker=FakeFindingResolutionChecker(),
+        max_input_tokens=1750,
+    )
+
+    use_case.execute(pr)
+
+    # conversation 포함 prompt 가 cap 초과 → fallback 진입 X (notice 만)
+    assert engine.diff_calls == [], (
+        "conversation 포함 prompt 가 budget 초과면 fallback 호출 안 함"
+    )
+    assert len(github.posted_comments) == 1
+    assert "예산 초과" in github.posted_comments[0][1]
 
 
 def test_use_case_proceeds_when_conversation_fetch_fails(

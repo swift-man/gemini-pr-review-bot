@@ -13,6 +13,7 @@ import jwt
 
 from gemini_review.domain import (
     ConversationEntry,
+    ConversationKind,
     Finding,
     PostedReviewComment,
     PrConversation,
@@ -522,16 +523,33 @@ class GitHubAppClient:
         entries: list[ConversationEntry] = []
         # 각 endpoint 의 일시적 실패는 다른 endpoint 의 entry 까지 잃게 만들면 안 됨 —
         # 부분 결과라도 모델에 컨텍스트로 주는 게 0 보다 가치 있음.
-        for path, kind in (
-            (f"/pulls/{pr.number}/reviews", "review"),
-            (f"/issues/{pr.number}/comments", "issue_comment"),
-            (f"/pulls/{pr.number}/comments", "line_comment"),
+        #
+        # **Newest-first 정렬** (codex/gemini PR #29 review #3): issue/line 코멘트
+        # endpoint 는 `sort=created&direction=desc` 지원 → 최신 먼저 fetch 해 10페이지
+        # cap 안에서도 가장 최근 1000 건 보장. `/pulls/{n}/reviews` 는 sort 파라미터 미지원
+        # → 그대로 호출 (PR 의 review submission 수는 보통 수십 건 이내라 cap 우려 적음).
+        #
+        # 정렬 정책:
+        # - GitHub API: newest-first (cap 안에 최신 모음)
+        # - 로컬 후처리: 시간 오름차순 (프롬프트 출력은 흐름순으로 자연스럽게)
+        for path, kind, supports_sort in (
+            (f"/pulls/{pr.number}/reviews", "review", False),
+            (f"/issues/{pr.number}/comments", "issue_comment", True),
+            (f"/pulls/{pr.number}/comments", "line_comment", True),
         ):
+            url = f"{base}{path}"
+            if supports_sort:
+                url = f"{url}?sort=created&direction=desc"
             try:
-                items = self._fetch_all_pages(
-                    f"{base}{path}", auth=f"token {token}"
-                )
-            except Exception as exc:  # noqa: BLE001 — graceful degrade per endpoint
+                items = self._fetch_all_pages(url, auth=f"token {token}")
+            except (
+                urllib.error.HTTPError,
+                urllib.error.URLError,
+                RuntimeError,
+            ) as exc:
+                # graceful degrade per endpoint — 네트워크/HTTP/응답 형식 오류만 흡수.
+                # 매핑 / 로직 버그 (TypeError, KeyError 등) 는 통과시켜 회귀를 silently
+                # 숨기지 않도록 (coderabbit PR #29 review #4).
                 logger.warning(
                     "fetch_pr_conversation: %s endpoint failed for %s#%d (%s); "
                     "skipping this slice, partial result",
@@ -548,8 +566,11 @@ class GitHubAppClient:
                 if mapped is not None:
                     entries.append(mapped)
 
-        # 시간 오름차순 정렬. submitted_at 결손 entry 는 빈 문자열로 끝에 모임 (드물게 발생).
-        entries.sort(key=lambda e: e.submitted_at)
+        # 시간 오름차순 정렬. submitted_at 결손 entry (`""`) 는 두 단계 key 로 명시적
+        # 끝-위치 (gemini+coderabbit PR #29 review #5): 그냥 `key=lambda e: e.submitted_at`
+        # 으로 정렬하면 빈 문자열이 가장 작은 값으로 평가돼 맨 앞에 위치해 주석 의도와
+        # 반대로 동작. `(missing flag, ts)` 로 빈 timestamp 는 True (= 1) 가 되어 끝에 모임.
+        entries.sort(key=lambda e: (e.submitted_at == "", e.submitted_at))
         return PrConversation(entries=tuple(entries))
 
     def _fetch_all_pages(
@@ -771,7 +792,7 @@ def _map_review_comment(
 def _map_conversation_entry(
     item: dict[str, Any],
     *,
-    kind: str,
+    kind: ConversationKind,
     pr_author_login: str,
 ) -> ConversationEntry | None:
     """GitHub API 응답 한 건 → `ConversationEntry`. 누락 / 이상 데이터는 None 으로 드롭.
@@ -821,7 +842,7 @@ def _map_conversation_entry(
     in_reply_to_id = raw_reply_to if isinstance(raw_reply_to, int) else None
 
     return ConversationEntry(
-        kind=kind,  # type: ignore[arg-type]
+        kind=kind,
         author_login=author_login,
         is_bot=is_bot,
         is_pr_author=is_pr_author,

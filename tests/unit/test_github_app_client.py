@@ -1712,3 +1712,104 @@ def test_fetch_pr_conversation_graceful_degrade_on_endpoint_failure(
         "fetch_pr_conversation: review endpoint failed" in r.getMessage()
         for r in caplog.records
     ), "endpoint 실패는 WARN 으로 관측 가능해야"
+
+
+def test_fetch_pr_conversation_uses_newest_first_sort_for_issue_and_line_endpoints(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """issue/line 엔드포인트는 `sort=created&direction=desc`. reviews 는 sort 미지원이라 plain.
+
+    회귀 방지 (codex/gemini PR #29 review #3): 기본 ASC + 10 페이지 cap 으로 1000+ 코멘트
+    PR 의 최신이 누락되던 회귀. issue/line 엔드포인트 newest-first 로 cap 안에서 최신 보장.
+    """
+    captured_urls: list[str] = []
+
+    def fake_urlopen(
+        req: urllib.request.Request,
+        *,
+        timeout: float | None = None,
+        context: ssl.SSLContext | None = None,
+    ) -> _FakeResponse:
+        if "access_tokens" in req.full_url:
+            return _FakeResponse(b'{"token": "tkn", "expires_at": ""}')
+        captured_urls.append(req.full_url)
+        return _FakeResponse(b"[]")
+
+    monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+    monkeypatch.setattr(jwt, "encode", lambda *a, **k: "fake.jwt")
+
+    client = GitHubAppClient(app_id=1234, private_key_pem="-")
+    client.fetch_pr_conversation(_sample_pr())
+
+    by_endpoint = {
+        "reviews": [u for u in captured_urls if "/reviews" in u],
+        "issue": [u for u in captured_urls if "/issues/" in u and "/comments" in u],
+        "line": [u for u in captured_urls if u.endswith("/comments?per_page=100&page=1")
+                 or "/pulls/9/comments?" in u and "issues" not in u],
+    }
+    # issue/line 엔드포인트 URL 에 sort=desc 포함
+    issue_url = next((u for u in captured_urls if "/issues/" in u), "")
+    line_url = next(
+        (u for u in captured_urls if "/pulls/" in u and "/comments" in u and "/reviews" not in u),
+        "",
+    )
+    assert "sort=created" in issue_url and "direction=desc" in issue_url, (
+        f"issue endpoint 가 newest-first 정렬돼야. URL: {issue_url}"
+    )
+    assert "sort=created" in line_url and "direction=desc" in line_url, (
+        f"line endpoint 가 newest-first 정렬돼야. URL: {line_url}"
+    )
+    # reviews 엔드포인트는 sort 파라미터 미지원 — plain
+    reviews_url = next((u for u in captured_urls if "/reviews" in u), "")
+    assert "sort=" not in reviews_url, (
+        f"reviews endpoint 는 sort 파라미터 미지원이라 plain 호출돼야. URL: {reviews_url}"
+    )
+
+
+def test_fetch_pr_conversation_sort_pushes_missing_timestamps_to_end(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """submitted_at 결손 entry (`""`) 는 정렬 결과 끝에 모임 — 가장 작은 값 처리 회귀 방지.
+
+    회귀 방지 (gemini+coderabbit PR #29 review #5): `key=lambda e: e.submitted_at` 만으로
+    정렬하면 빈 문자열이 최소값으로 평가돼 맨 앞에 위치. `(missing flag, ts)` 두 단계 key 로
+    빈 timestamp 가 끝에 가도록.
+    """
+    monkeypatch.setattr(
+        urllib.request,
+        "urlopen",
+        _make_fake_conversation_urlopen(
+            reviews=[],
+            issue_comments=[
+                {
+                    "id": 1,
+                    "user": {"login": "alice"},
+                    "body": "정상 timestamp",
+                    "created_at": "2026-04-26T10:00:00Z",
+                },
+                {
+                    "id": 2,
+                    "user": {"login": "bob"},
+                    "body": "결손 timestamp",
+                    # created_at 없음 — 빈 문자열로 매핑
+                },
+                {
+                    "id": 3,
+                    "user": {"login": "carol"},
+                    "body": "더 최근 timestamp",
+                    "created_at": "2026-04-26T20:00:00Z",
+                },
+            ],
+            line_comments=[],
+        ),
+    )
+    monkeypatch.setattr(jwt, "encode", lambda *a, **k: "fake.jwt")
+
+    client = GitHubAppClient(app_id=1234, private_key_pem="-")
+    conv = client.fetch_pr_conversation(_sample_pr())
+
+    bodies_in_order = [e.body for e in conv.entries]
+    # 정상 timestamp 두 건이 시간순으로 먼저, 결손 timestamp 가 끝에
+    assert bodies_in_order == ["정상 timestamp", "더 최근 timestamp", "결손 timestamp"], (
+        f"빈 timestamp 는 끝으로 정렬돼야. 실제 순서: {bodies_in_order}"
+    )
