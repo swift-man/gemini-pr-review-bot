@@ -45,6 +45,12 @@ class PullRequest:
     # binary/삭제/truncate 파일은 patch 가 None 으로 와서 이 튜플에서 제외된다.
     # 형식: `((path, raw_patch_text), ...)` — frozen 호환 + addable_lines 와 짝.
     file_patches: tuple[tuple[str, str], ...] = field(default_factory=tuple)
+    # PR 작성자의 GitHub login. Layer F (PR-1) 의 conversation grounding 이 코멘트의
+    # `author_login` 과 비교해 `is_pr_author` 플래그를 정확히 세팅하는 데 사용
+    # ("작성자가 deferred 로 응답한 항목" 같은 룰의 정확성에 필수).
+    # 빈 문자열은 backward-compat — 기존 테스트 PR builder 가 채우지 않아도 동작 유지
+    # (단 conversation 매칭이 일부 부정확해질 수 있음).
+    author_login: str = ""
 
     def effective_fetch_ref(self) -> str:
         """실제 `git fetch` 에 사용할 ref — `fetch_ref` 가 비어 있으면 `head_sha` 로 fallback.

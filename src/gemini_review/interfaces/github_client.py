@@ -1,6 +1,12 @@
 from typing import Protocol
 
-from gemini_review.domain import PostedReviewComment, PullRequest, RepoRef, ReviewResult
+from gemini_review.domain import (
+    PostedReviewComment,
+    PrConversation,
+    PullRequest,
+    RepoRef,
+    ReviewResult,
+)
 
 
 class GitHubClient(Protocol):
@@ -44,6 +50,23 @@ class GitHubClient(Protocol):
         [Major] finding 의 대상 라인이 새 push 에서 변경됐을 때 "수정 여부 확인" 대댓글을
         다는 데 사용. GitHub 의 `POST /repos/{}/{}/pulls/{n}/comments/{cid}/replies`
         엔드포인트.
+        """
+        ...
+
+    def fetch_pr_conversation(self, pr: PullRequest) -> PrConversation:
+        """PR 의 대화 항목 (review submission / 토론 코멘트 / 라인 코멘트) 통합 조회.
+
+        PR-1 (`feat/pr-conversation-context-injection`): 봇 review 직전에 호출돼 프롬프트
+        의 `=== PR CONVERSATION HISTORY ===` 섹션 입력. 모델이 다른 reviewer 의견 / 작성
+        자 reply 를 컨텍스트로 사용해 같은 지적 반복 회피.
+
+        호출 endpoint:
+        - `GET /repos/{}/{}/pulls/{n}/reviews` — review submission
+        - `GET /repos/{}/{}/issues/{n}/comments` — top-level 토론
+        - `GET /repos/{}/{}/pulls/{n}/comments` — 라인 review comment (모든 author)
+
+        반환: 시간 오름차순 정렬된 `ConversationEntry` 모음. 빈 PR (대화 0 건) 도 정상
+        — `PrConversation(entries=())` 반환.
         """
         ...
 

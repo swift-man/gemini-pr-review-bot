@@ -16,6 +16,7 @@ from gemini_review.domain import (
     FileDump,
     FileEntry,
     PostedReviewComment,
+    PrConversation,
     PullRequest,
     RepoRef,
     ReviewEvent,
@@ -76,6 +77,12 @@ class FakeGitHub:
         # DiffBasedResolutionChecker 의 진짜 동작은 별도 단위 테스트에서 검증.
         return
 
+    def fetch_pr_conversation(self, pr: PullRequest) -> PrConversation:
+        # 웹훅 흐름 테스트는 conversation context 와 무관 — 빈 대화 반환 (이전 동작 그대로).
+        # PR-1 의 진짜 동작은 별도 단위 테스트 (`test_github_app_client.py` /
+        # `test_gemini_prompt.py`) 에서 검증.
+        return PrConversation(entries=())
+
     def get_installation_token(self, installation_id: int) -> str:
         return "fake-token"
 
@@ -101,11 +108,24 @@ class FakeEngine:
         self._result = result
         # diff fallback 진입 시 사용된 인자 기록 — 테스트 검증용
         self.diff_calls: list[tuple[PullRequest, str]] = []
+        # 일반 review 호출 시 받은 conversation 기록 (PR-1 검증용)
+        self.review_conversations: list[PrConversation | None] = []
 
-    def review(self, pr: PullRequest, dump: FileDump) -> ReviewResult:
+    def review(
+        self,
+        pr: PullRequest,
+        dump: FileDump,
+        conversation: PrConversation | None = None,
+    ) -> ReviewResult:
+        self.review_conversations.append(conversation)
         return self._result
 
-    def review_diff(self, pr: PullRequest, diff_text: str) -> ReviewResult:
+    def review_diff(
+        self,
+        pr: PullRequest,
+        diff_text: str,
+        conversation: PrConversation | None = None,
+    ) -> ReviewResult:
         # diff fallback 흐름 테스트가 결과를 일반 review 와 구분할 수 있도록 새 객체로 반환.
         # 호출 인자도 함께 기록해 fallback 진입 자체와 입력 내용을 검증 가능.
         self.diff_calls.append((pr, diff_text))
@@ -658,6 +678,125 @@ def test_use_case_posts_review_when_budget_fits(tmp_path: Path) -> None:
     assert github.posted_reviews[0][1] is expected
 
 
+def test_use_case_fetches_pr_conversation_and_passes_to_engine(
+    tmp_path: Path,
+) -> None:
+    """use case 는 review 직전 conversation 을 fetch 해 engine 에 주입한다 (PR-1 wiring lock).
+
+    회귀 방지: PR-1 의 핵심 invariant — engine 이 conversation 을 받아 프롬프트에 주입.
+    fetch 흐름이 빠지면 prompt 에 컨텍스트 섹션이 안 들어가 모델이 같은 지적을 반복.
+    """
+    fake_conversation = PrConversation(entries=(
+        # 더미 entry — engine 이 받았는지만 검증
+        PostedReviewComment(
+            comment_id=1, commit_id="abc", path="a.py", line=1, body="x",
+        ),  # noqa — actually we just need a non-empty conversation
+    ))
+
+    class _RecordingFakeGitHub(FakeGitHub):
+        def __init__(self) -> None:
+            super().__init__()
+            self.fetched_for: list[int] = []
+
+        def fetch_pr_conversation(self, pr: PullRequest) -> PrConversation:
+            self.fetched_for.append(pr.number)
+            # 의도적으로 entry 1건 — engine 이 received conversation 의 entries 가
+            # 비어 있지 않음을 검증할 수 있음
+            from gemini_review.domain import ConversationEntry
+            return PrConversation(entries=(
+                ConversationEntry(
+                    kind="review",
+                    author_login="other-bot[bot]",
+                    is_bot=True,
+                    is_pr_author=False,
+                    submitted_at="2026-04-26T10:00:00Z",
+                    body="이전 라운드 의견",
+                    state="COMMENTED",
+                ),
+            ))
+
+    github = _RecordingFakeGitHub()
+    pr = _sample_pr()
+    dump = FileDump(
+        entries=(FileEntry(path="a.py", content="x=1", size_bytes=3, is_changed=True),),
+        total_chars=3,
+        exceeded_budget=False,
+    )
+    expected = ReviewResult(summary="ok", event=ReviewEvent.COMMENT)
+    engine = FakeEngine(expected)
+    use_case = ReviewPullRequestUseCase(
+        github=github,
+        repo_fetcher=FakeFetcher(tmp_path),
+        file_collector=FakeCollector(dump),
+        engine=engine,
+        finding_verifier=FakeFindingVerifier(),
+        finding_deduper=FakeFindingDeduper(),
+        resolution_checker=FakeFindingResolutionChecker(),
+        max_input_tokens=1000,
+    )
+
+    use_case.execute(pr)
+
+    # 1. fetch_pr_conversation 이 PR 마다 한 번 호출돼야
+    assert github.fetched_for == [pr.number], (
+        "review 직전 PR 당 1번 conversation fetch 호출"
+    )
+    # 2. engine.review 가 받은 conversation 이 fetch 결과여야 (주입 흐름 lock)
+    assert len(engine.review_conversations) == 1
+    received = engine.review_conversations[0]
+    assert received is not None and len(received.entries) == 1
+    assert received.entries[0].body == "이전 라운드 의견"
+
+
+def test_use_case_proceeds_when_conversation_fetch_fails(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """fetch_pr_conversation 실패 → 빈 conversation 으로 fall-back, review 정상 진행.
+
+    회귀 방지: conversation fetch 가 일시 장애 (rate limit, 5xx) 일 때 review 자체가
+    중단되면 안 됨. 컨텍스트만 잠시 못 보여줄 뿐 핵심 review 흐름은 살아 있어야.
+    """
+    import logging
+
+    class _FailingGitHub(FakeGitHub):
+        def fetch_pr_conversation(self, pr: PullRequest) -> PrConversation:
+            raise RuntimeError("rate limit exceeded")
+
+    github = _FailingGitHub()
+    pr = _sample_pr()
+    dump = FileDump(
+        entries=(FileEntry(path="a.py", content="x=1", size_bytes=3, is_changed=True),),
+        total_chars=3,
+        exceeded_budget=False,
+    )
+    engine = FakeEngine(ReviewResult(summary="ok", event=ReviewEvent.COMMENT))
+    use_case = ReviewPullRequestUseCase(
+        github=github,
+        repo_fetcher=FakeFetcher(tmp_path),
+        file_collector=FakeCollector(dump),
+        engine=engine,
+        finding_verifier=FakeFindingVerifier(),
+        finding_deduper=FakeFindingDeduper(),
+        resolution_checker=FakeFindingResolutionChecker(),
+        max_input_tokens=1000,
+    )
+
+    with caplog.at_level(logging.WARNING):
+        use_case.execute(pr)
+
+    # review 는 정상 진행 — 빈 conversation 으로 fall-back
+    assert len(engine.review_conversations) == 1
+    received = engine.review_conversations[0]
+    assert received is not None and received.is_empty(), (
+        "fetch 실패 → 빈 PrConversation 으로 fall-back"
+    )
+    assert len(github.posted_reviews) == 1, "review 게시는 정상 진행돼야"
+    assert any(
+        "fetch_pr_conversation failed" in r.getMessage() for r in caplog.records
+    ), "fetch 실패는 WARN 으로 관측 가능"
+
+
 def test_use_case_chains_verify_then_dedupe_then_post_then_resolution_check(
     tmp_path: Path,
 ) -> None:
@@ -800,7 +939,12 @@ class _BlockingEngine:
         self.started = threading.Event()
         self.release = threading.Event()
 
-    def review(self, pr: PullRequest, dump: FileDump) -> ReviewResult:
+    def review(
+        self,
+        pr: PullRequest,
+        dump: FileDump,
+        conversation: PrConversation | None = None,
+    ) -> ReviewResult:
         self.started.set()
         self.release.wait(timeout=5.0)
         return self._result
@@ -971,7 +1115,12 @@ class _RecordingBlockingEngine:
         with self._lock:
             return self._release.setdefault(key, threading.Event())
 
-    def review(self, pr: PullRequest, dump: FileDump) -> ReviewResult:
+    def review(
+        self,
+        pr: PullRequest,
+        dump: FileDump,
+        conversation: PrConversation | None = None,
+    ) -> ReviewResult:
         key = (pr.repo.full_name, pr.number)
         with self._lock:
             self.entered.append(key)

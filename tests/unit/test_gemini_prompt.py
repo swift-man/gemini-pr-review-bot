@@ -448,3 +448,199 @@ def test_diff_mode_notice_is_a_separate_prominent_section() -> None:
     assert DIFF_MODE_NOTICE.strip() in prompt, (
         "notice block 전체가 prompt 에 그대로 포함돼야 (split/dilute 금지)"
     )
+
+
+# --- PR conversation context (PR-1: feat/pr-conversation-context-injection) -
+
+from gemini_review.domain import (  # noqa: E402
+    ConversationEntry,
+    PrConversation,
+)
+from gemini_review.infrastructure.gemini_prompt import (  # noqa: E402
+    render_pr_conversation,
+)
+
+
+def _conv_entry(**overrides: object) -> ConversationEntry:
+    defaults: dict[str, object] = {
+        "kind": "review",
+        "author_login": "alice",
+        "is_bot": False,
+        "is_pr_author": False,
+        "submitted_at": "2026-04-26T10:00:00Z",
+        "body": "default body",
+    }
+    defaults.update(overrides)
+    return ConversationEntry(**defaults)  # type: ignore[arg-type]
+
+
+def test_render_empty_conversation_returns_empty_string() -> None:
+    """빈 conversation → 빈 문자열 (build_prompt 가 섹션 자체를 prompt 에서 제외하는 신호).
+
+    회귀 방지 (사용자 요구: "빈 섹션은 그대로 동작"): 빈 PR 의 첫 review 등 conversation
+    이 비어 있을 때 섹션 헤더만 들어가서 모델을 헷갈리게 하면 안 됨. None 도 동일 처리.
+    """
+    assert render_pr_conversation(None) == ""
+    assert render_pr_conversation(PrConversation()) == ""
+
+
+def test_render_groups_entries_by_kind_and_orders_them() -> None:
+    """review / discussion / line_comment 세 그룹으로 묶여 출력 — 가독성 + 모델 분류 용이."""
+    conv = PrConversation(entries=(
+        _conv_entry(kind="review", state="COMMENTED", body="첫 review"),
+        _conv_entry(kind="issue_comment", body="topic 토론"),
+        _conv_entry(
+            kind="line_comment", path="a.py", line=10, comment_id=99, body="라인 지적"
+        ),
+    ))
+
+    out = render_pr_conversation(conv)
+
+    # 헤더 + 그룹 헤더들
+    assert "=== PR CONVERSATION HISTORY ===" in out
+    assert "--- REVIEWS ---" in out
+    assert "--- DISCUSSION ---" in out
+    assert "--- LINE COMMENTS ---" in out
+    # 본문이 모두 들어가야
+    assert "첫 review" in out
+    assert "topic 토론" in out
+    assert "라인 지적" in out
+
+
+def test_render_marks_pr_author_and_bot_distinctly() -> None:
+    """[작성자] / [bot] 마커로 권한·역할 구분 — 작성자 의견에 더 가중치 두는 모델 판정 도움."""
+    conv = PrConversation(entries=(
+        _conv_entry(author_login="swift-man", is_pr_author=True, body="작성자 응답"),
+        _conv_entry(author_login="codex[bot]", is_bot=True, body="다른 봇 의견"),
+        _conv_entry(author_login="reviewer-alice", body="외부 reviewer 의견"),
+    ))
+
+    out = render_pr_conversation(conv)
+
+    # 작성자
+    assert "swift-man [작성자]" in out
+    # 봇
+    assert "codex[bot] [bot]" in out
+    # 외부 reviewer 는 마커 없음 (login 만)
+    assert "reviewer-alice:" in out or "reviewer-alice " in out
+
+
+def test_render_includes_review_state_for_review_kind() -> None:
+    """review entry 의 state (APPROVED/COMMENTED/CHANGES_REQUESTED) 가 표기돼 모델이 신호 강도 인지."""
+    conv = PrConversation(entries=(
+        _conv_entry(kind="review", state="CHANGES_REQUESTED", body="블로커"),
+        _conv_entry(kind="review", state="APPROVED", body="OK"),
+    ))
+
+    out = render_pr_conversation(conv)
+
+    assert "(CHANGES_REQUESTED)" in out
+    assert "(APPROVED)" in out
+
+
+def test_render_line_comment_includes_path_line_and_comment_id() -> None:
+    """line_comment 는 (path, line) anchor + comment_id 노출 — PR-2 reply 후보 추적용."""
+    conv = PrConversation(entries=(
+        _conv_entry(
+            kind="line_comment",
+            path="src/foo.py",
+            line=42,
+            comment_id=12345,
+            body="잠재 버그",
+        ),
+    ))
+
+    out = render_pr_conversation(conv)
+
+    assert "@ src/foo.py:42" in out
+    assert "cid=12345" in out
+
+
+def test_render_outdated_line_comment_shows_outdated_marker() -> None:
+    """line=null (outdated) 코멘트는 'outdated' 로 표기 — anchor 깨짐을 모델이 인지."""
+    conv = PrConversation(entries=(
+        _conv_entry(
+            kind="line_comment",
+            path="src/foo.py",
+            line=None,
+            comment_id=12345,
+            body="옛 코멘트",
+        ),
+    ))
+
+    out = render_pr_conversation(conv)
+
+    assert "@ src/foo.py:outdated" in out
+
+
+def test_render_caps_entries_to_token_budget_keeping_newest() -> None:
+    """conversation 이 max_chars 초과 시 오래된 entry 부터 잘라내고 truncation 마커 노출.
+
+    회귀 방지: 활발한 PR 에서 prompt 토큰 폭증 방지. newest-first 가 정책 — 최근 신호가
+    가장 relevant.
+    """
+    # 큰 body 로 의도적으로 cap 초과
+    big_body = "X" * 5000
+    entries = tuple(
+        _conv_entry(
+            submitted_at=f"2026-04-26T{i:02d}:00:00Z",
+            body=f"#{i}: {big_body}",
+        )
+        for i in range(5)
+    )
+    out = render_pr_conversation(PrConversation(entries=entries))
+
+    # 가장 오래된 entry (#0) 는 잘림, 가장 최근 (#4) 은 포함돼야
+    assert "#4:" in out, "최신 entry 는 cap 안에서 보존돼야"
+    assert "#0:" not in out, "가장 오래된 entry 는 cap 초과로 잘려야"
+    assert "truncated" in out, "잘린 entry 가 있다는 안내 마커가 노출돼야"
+
+
+def test_render_does_not_truncate_when_under_budget() -> None:
+    """cap 안이면 모든 entry 포함 + truncation 마커 없음."""
+    entries = tuple(
+        _conv_entry(submitted_at=f"2026-04-26T{i:02d}:00:00Z", body=f"#{i}: 짧은 본문")
+        for i in range(3)
+    )
+    out = render_pr_conversation(PrConversation(entries=entries))
+
+    for i in range(3):
+        assert f"#{i}: 짧은 본문" in out
+    assert "truncated" not in out
+
+
+def test_build_prompt_includes_conversation_section_when_present() -> None:
+    """build_prompt 에 conversation 주입 시 섹션이 prompt 에 들어가야 (use case wiring 검증)."""
+    dump = FileDump(entries=(), total_chars=0)
+    conv = PrConversation(entries=(
+        _conv_entry(body="이전 round 의견"),
+    ))
+
+    prompt = build_prompt(_pr(), dump, conversation=conv)
+
+    assert "=== PR CONVERSATION HISTORY ===" in prompt
+    assert "이전 round 의견" in prompt
+
+
+def test_build_prompt_omits_conversation_section_when_empty() -> None:
+    """빈 conversation 이면 prompt 에 섹션 자체가 안 들어감 — 기존 동작 그대로 (회귀 방지)."""
+    dump = FileDump(entries=(), total_chars=0)
+    prompt_with_empty = build_prompt(_pr(), dump, conversation=PrConversation())
+    prompt_without = build_prompt(_pr(), dump)
+
+    assert "=== PR CONVERSATION HISTORY ===" not in prompt_with_empty
+    # 빈 conversation 과 None 결과는 동일해야 — backward compat
+    assert prompt_with_empty == prompt_without
+
+
+def test_build_diff_prompt_includes_conversation_section_when_present() -> None:
+    """diff fallback prompt 도 conversation 주입 받음 (full / diff 두 모드 모두 동일 정책)."""
+    pr = _pr()
+    conv = PrConversation(entries=(
+        _conv_entry(body="diff 모드에서도 컨텍스트 사용"),
+    ))
+
+    prompt = build_diff_prompt(pr, "stub diff", conversation=conv)
+
+    assert "=== PR CONVERSATION HISTORY ===" in prompt
+    assert "diff 모드에서도 컨텍스트 사용" in prompt
