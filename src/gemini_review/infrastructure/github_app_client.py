@@ -12,8 +12,11 @@ import certifi
 import jwt
 
 from gemini_review.domain import (
+    ConversationEntry,
+    ConversationKind,
     Finding,
     PostedReviewComment,
+    PrConversation,
     PullRequest,
     RepoRef,
     ReviewEvent,
@@ -198,6 +201,16 @@ class GitHubAppClient:
                 # 을 그대로 반환하므로 `default` 가 적용되지 않는다. `str(None)` 이 들어가
                 # `"None"` 문자열로 오염되는 회귀를 막기 위해 `or ""` 패턴으로 일관 처리
                 # (gemini PR #19 review #2 — body 와 동일한 패턴 채택).
+                # PR 작성자 login — Layer F (PR-1) conversation grounding 이 작성자
+                # 코멘트 ("deferred", "follow-up" 등) 를 다른 reviewer 와 구분하는 데
+                # 사용. user 객체가 비거나 없으면 "" — 매칭이 일부 부정확해질 뿐 동작
+                # 자체는 안전.
+                user = recheck.get("user")
+                author_login = (
+                    str(user["login"])
+                    if isinstance(user, dict) and user.get("login")
+                    else ""
+                )
                 return PullRequest(
                     repo=repo,
                     number=number,
@@ -214,6 +227,7 @@ class GitHubAppClient:
                     is_draft=bool(recheck.get("draft", False)),
                     addable_lines=tuple(addable),
                     file_patches=tuple(patches),
+                    author_login=author_login,
                 )
 
             # 다음 iteration 은 이 recheck 결과를 시작점으로 — 여분의 /pulls 호출 회피.
@@ -492,6 +506,98 @@ class GitHubAppClient:
         )
         return tuple(results)
 
+    def fetch_pr_conversation(self, pr: PullRequest) -> PrConversation:
+        """PR 의 모든 대화 항목 (review / 토론 / 라인 코멘트) 통합 fetch.
+
+        세 endpoint 를 호출해 모두 ConversationEntry 로 매핑 → 시간 오름차순 정렬해
+        반환. 실패는 graceful degrade — 한 endpoint 가 실패해도 나머지 엔트리는 모음
+        (어차피 호출자도 fail-open 정책: 컨텍스트 부재 = 기존 동작).
+
+        ### 호출 비용
+        매 review 마다 3 endpoints (review/issue/line) × 페이지네이션. 활발한 PR 도 보통
+        ≤ 6 round-trips. rate limit 영향 미미 (PR 당 fetch_pull_request 의 N + 3).
+        """
+        token = self.get_installation_token(pr.installation_id)
+        base = f"{self._api_base}/repos/{pr.repo.full_name}"
+
+        entries: list[ConversationEntry] = []
+        # 각 endpoint 의 일시적 실패는 다른 endpoint 의 entry 까지 잃게 만들면 안 됨 —
+        # 부분 결과라도 모델에 컨텍스트로 주는 게 0 보다 가치 있음.
+        #
+        # **Newest-first 정렬** (codex/gemini PR #29 review #3): issue/line 코멘트
+        # endpoint 는 `sort=created&direction=desc` 지원 → 최신 먼저 fetch 해 10페이지
+        # cap 안에서도 가장 최근 1000 건 보장. `/pulls/{n}/reviews` 는 sort 파라미터 미지원
+        # → 그대로 호출 (PR 의 review submission 수는 보통 수십 건 이내라 cap 우려 적음).
+        #
+        # 정렬 정책:
+        # - GitHub API: newest-first (cap 안에 최신 모음)
+        # - 로컬 후처리: 시간 오름차순 (프롬프트 출력은 흐름순으로 자연스럽게)
+        for path, kind, supports_sort in (
+            (f"/pulls/{pr.number}/reviews", "review", False),
+            (f"/issues/{pr.number}/comments", "issue_comment", True),
+            (f"/pulls/{pr.number}/comments", "line_comment", True),
+        ):
+            url = f"{base}{path}"
+            if supports_sort:
+                url = f"{url}?sort=created&direction=desc"
+            try:
+                items = self._fetch_all_pages(url, auth=f"token {token}")
+            except (
+                urllib.error.HTTPError,
+                urllib.error.URLError,
+                RuntimeError,
+            ) as exc:
+                # graceful degrade per endpoint — 네트워크/HTTP/응답 형식 오류만 흡수.
+                # 매핑 / 로직 버그 (TypeError, KeyError 등) 는 통과시켜 회귀를 silently
+                # 숨기지 않도록 (coderabbit PR #29 review #4).
+                logger.warning(
+                    "fetch_pr_conversation: %s endpoint failed for %s#%d (%s); "
+                    "skipping this slice, partial result",
+                    kind,
+                    pr.repo.full_name,
+                    pr.number,
+                    exc,
+                )
+                continue
+            for item in items:
+                mapped = _map_conversation_entry(
+                    item, kind=kind, pr_author_login=pr.author_login
+                )
+                if mapped is not None:
+                    entries.append(mapped)
+
+        # 시간 오름차순 정렬. submitted_at 결손 entry (`""`) 는 두 단계 key 로 명시적
+        # 끝-위치 (gemini+coderabbit PR #29 review #5): 그냥 `key=lambda e: e.submitted_at`
+        # 으로 정렬하면 빈 문자열이 가장 작은 값으로 평가돼 맨 앞에 위치해 주석 의도와
+        # 반대로 동작. `(missing flag, ts)` 로 빈 timestamp 는 True (= 1) 가 되어 끝에 모임.
+        entries.sort(key=lambda e: (e.submitted_at == "", e.submitted_at))
+        return PrConversation(entries=tuple(entries))
+
+    def _fetch_all_pages(
+        self, base_url: str, *, auth: str, max_pages: int = 10
+    ) -> list[dict[str, Any]]:
+        """`per_page=100` 으로 page=1..max_pages 반복 fetch. 100 미만 응답 시 종료.
+
+        `list_self_review_comments` 의 페이지네이션 로직과 동일한 패턴 — 별도 helper 로
+        뽑아 conversation fetch 도 같은 invariant 따름. 안전망으로 `max_pages` cap.
+        """
+        sep = "&" if "?" in base_url else "?"
+        per_page_url = f"{base_url}{sep}per_page=100"
+        results: list[dict[str, Any]] = []
+        for page in range(1, max_pages + 1):
+            items = self._request_list(
+                "GET", f"{per_page_url}&page={page}", auth=auth
+            )
+            results.extend(items)
+            if len(items) < 100:
+                return results
+        logger.warning(
+            "_fetch_all_pages capped at %d pages for %s; result may be incomplete",
+            max_pages,
+            base_url,
+        )
+        return results
+
     # --- HTTP ---------------------------------------------------------------
     #
     # `_http` 는 인증·직렬화·HTTPError 로깅만 책임지는 저수준 원시 호출. 반환 타입은
@@ -560,7 +666,7 @@ class GitHubAppClient:
         req = urllib.request.Request(url, data=data, method=method, headers=headers)
         try:
             with urllib.request.urlopen(req, timeout=30, context=self._tls_context) as resp:  # noqa: S310
-                return json.loads(resp.read().decode("utf-8") or "{}")
+                raw = resp.read().decode("utf-8") or "{}"
         except urllib.error.HTTPError as exc:
             # `exc.read()` 는 1회용 stream — 여기서 읽고 나면 호출부가 다시 못 읽는다.
             # 호출부가 422 의 구체 사유(예: "line must be part of the diff" vs 다른 검증
@@ -570,6 +676,24 @@ class GitHubAppClient:
             exc.gemini_review_detail = detail  # type: ignore[attr-defined]
             logger.error("GitHub %s %s failed: %s %s", method, url, exc.code, detail[:500])
             raise
+
+        # 200 OK 본문이라도 JSON 형식이 망가졌을 수 있다 (gemini PR #29 review #2):
+        # 프록시 (Cloudflare 등) 가 5xx HTML 페이지를 200 으로 가로채는 케이스, 또는
+        # GitHub 가 잘못된 응답을 보낸 희소 사례. `json.loads` 의 `JSONDecodeError` 는
+        # `ValueError` 하위라 호출부의 `(HTTPError, URLError, RuntimeError)` 그물에
+        # 안 잡혀 파이프라인 크래시 가능. 명시적 `RuntimeError` 변환으로 graceful degrade
+        # 경로에 흡수되도록.
+        try:
+            return json.loads(raw)
+        except json.JSONDecodeError as exc:
+            logger.error(
+                "GitHub %s %s returned 200 but body is not valid JSON: %s "
+                "(body_preview=%r)",
+                method, url, exc, raw[:200],
+            )
+            raise RuntimeError(
+                f"invalid JSON in 200 response from {method} {url}: {exc}"
+            ) from exc
 
 
 def _resolve_fetch_source(
@@ -680,6 +804,73 @@ def _map_review_comment(
         in_reply_to_id=in_reply_to_id,
         original_commit_id=original_commit_id,
         original_line=original_line,
+    )
+
+
+def _map_conversation_entry(
+    item: dict[str, Any],
+    *,
+    kind: ConversationKind,
+    pr_author_login: str,
+) -> ConversationEntry | None:
+    """GitHub API 응답 한 건 → `ConversationEntry`. 누락 / 이상 데이터는 None 으로 드롭.
+
+    안전 정책: 잘못 매핑된 entry 가 프롬프트에 들어가서 모델을 헷갈리게 만드는 것보다
+    드롭하는 게 안전 (graceful degrade). 누락 필드는 `""` / None 으로 안전 fallback,
+    꼭 필요한 필드 (body, author_login) 가 비면 entry 자체를 드롭.
+    """
+    user = item.get("user")
+    author_login = (
+        str(user["login"])
+        if isinstance(user, dict) and user.get("login")
+        else ""
+    )
+    body = item.get("body")
+    if not author_login or not isinstance(body, str) or not body:
+        return None
+
+    # 봇 판정: `[bot]` 접미사 + `performed_via_github_app` 키 (둘 중 하나라도 있으면 봇).
+    # GitHub 의 user.type == "Bot" 도 신호이지만 일관성 위해 위 두 가지 우선.
+    is_bot = author_login.endswith("[bot]") or isinstance(
+        item.get("performed_via_github_app"), dict
+    )
+    is_pr_author = bool(pr_author_login) and author_login == pr_author_login
+
+    submitted_at = (
+        str(item.get("submitted_at") or item.get("created_at") or "")
+    )
+
+    # state 는 review 만 (`COMMENTED`/`APPROVED`/`CHANGES_REQUESTED`).
+    raw_state = item.get("state") if kind == "review" else None
+    state = str(raw_state) if isinstance(raw_state, str) else None
+
+    # comment_id: line_comment / issue_comment 만 의미. review 는 reply 대상 아님 — None.
+    raw_id = item.get("id") if kind in ("line_comment", "issue_comment") else None
+    comment_id = raw_id if isinstance(raw_id, int) else None
+
+    # path / line: line_comment 만. line 이 None (outdated) 도 그대로 통과 — 컨텍스트로
+    # 는 여전히 의미 있음 (모델이 "이 코멘트는 이미 outdated" 로 인지). PR-2 의 reply
+    # candidate 필터에서 line is None 인 건 제외할 예정.
+    raw_path = item.get("path") if kind == "line_comment" else None
+    path = str(raw_path) if isinstance(raw_path, str) else None
+    raw_line = item.get("line") if kind == "line_comment" else None
+    line = raw_line if isinstance(raw_line, int) else None
+
+    raw_reply_to = item.get("in_reply_to_id") if kind == "line_comment" else None
+    in_reply_to_id = raw_reply_to if isinstance(raw_reply_to, int) else None
+
+    return ConversationEntry(
+        kind=kind,
+        author_login=author_login,
+        is_bot=is_bot,
+        is_pr_author=is_pr_author,
+        submitted_at=submitted_at,
+        body=body,
+        state=state,
+        comment_id=comment_id,
+        path=path,
+        line=line,
+        in_reply_to_id=in_reply_to_id,
     )
 
 

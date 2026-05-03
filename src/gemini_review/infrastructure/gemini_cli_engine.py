@@ -4,7 +4,7 @@ import logging
 import subprocess
 from pathlib import Path
 
-from gemini_review.domain import FileDump, PullRequest, ReviewResult
+from gemini_review.domain import FileDump, PrConversation, PullRequest, ReviewResult
 
 from .gemini_parser import parse_review
 from .gemini_prompt import build_diff_prompt, build_prompt, paths_in_pr_diff
@@ -130,8 +130,13 @@ class GeminiCliEngine:
                 f"해결: 파일을 삭제하고 `{self._binary}` 를 다시 실행해 로그인하세요."
             )
 
-    def review(self, pr: PullRequest, dump: FileDump) -> ReviewResult:
-        prompt = build_prompt(pr, dump)
+    def review(
+        self,
+        pr: PullRequest,
+        dump: FileDump,
+        conversation: PrConversation | None = None,
+    ) -> ReviewResult:
+        prompt = build_prompt(pr, dump, conversation=conversation)
         # 전체 모드의 valid_paths 는 PR 전체 변경 파일 — 일반 흐름은 모든 변경 파일에
         # 대해 finding 을 받는 게 정상.
         return self._run_with_model_fallback(
@@ -141,11 +146,19 @@ class GeminiCliEngine:
             invoke_log_kv={
                 "files": len(dump.entries),
                 "chars": dump.total_chars,
+                "conversation_entries": (
+                    len(conversation.entries) if conversation else 0
+                ),
                 "mode": "full",
             },
         )
 
-    def review_diff(self, pr: PullRequest, diff_text: str) -> ReviewResult:
+    def review_diff(
+        self,
+        pr: PullRequest,
+        diff_text: str,
+        conversation: PrConversation | None = None,
+    ) -> ReviewResult:
         """전체 코드베이스 컨텍스트 한도 초과 시의 fallback — diff 만으로 리뷰 수행.
 
         프롬프트가 모델에게 cross-file 단언 금지 + [Critical]/[Major] 등급 절제를
@@ -161,7 +174,7 @@ class GeminiCliEngine:
         2. ReviewResult.summary 에 diff-only 모드 안내 prepend — 리뷰 수신자가 본문
            상단에서 narrower 리뷰임을 즉시 인지.
         """
-        prompt = build_diff_prompt(pr, diff_text)
+        prompt = build_diff_prompt(pr, diff_text, conversation=conversation)
         valid_paths = paths_in_pr_diff(pr)
         result = self._run_with_model_fallback(
             pr=pr,
@@ -170,6 +183,9 @@ class GeminiCliEngine:
             invoke_log_kv={
                 "diff_chars": len(diff_text),
                 "files": len(valid_paths),
+                "conversation_entries": (
+                    len(conversation.entries) if conversation else 0
+                ),
                 "mode": "diff",
             },
         )

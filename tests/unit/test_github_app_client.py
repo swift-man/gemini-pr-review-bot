@@ -1488,3 +1488,357 @@ def test_reply_to_review_comment_skips_post_in_dry_run(
     client.reply_to_review_comment(_sample_pr(), comment_id=1, body="x")
 
     assert posted == [], "DRY_RUN 이면 어떤 게시도 일어나지 않아야"
+
+
+# --- fetch_pr_conversation (PR-1: feat/pr-conversation-context-injection) ---
+
+
+def _make_fake_conversation_urlopen(
+    reviews: list[dict[str, Any]],
+    issue_comments: list[dict[str, Any]],
+    line_comments: list[dict[str, Any]],
+):
+    """3 endpoints (reviews / issue comments / line comments) 응답 시뮬."""
+
+    def fake_urlopen(
+        req: urllib.request.Request,
+        *,
+        timeout: float | None = None,
+        context: ssl.SSLContext | None = None,
+    ) -> _FakeResponse:
+        if "access_tokens" in req.full_url:
+            return _FakeResponse(b'{"token": "tkn", "expires_at": ""}')
+        url = req.full_url
+        if "/pulls/" in url and "/reviews" in url:
+            return _FakeResponse(json.dumps(reviews).encode())
+        if "/issues/" in url and "/comments" in url:
+            return _FakeResponse(json.dumps(issue_comments).encode())
+        if "/pulls/" in url and "/comments" in url:
+            return _FakeResponse(json.dumps(line_comments).encode())
+        return _FakeResponse(b"[]")
+
+    return fake_urlopen
+
+
+def test_fetch_pr_conversation_aggregates_three_endpoints(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """3 endpoints (reviews / issue / line) 의 모든 항목이 통합된 PrConversation 으로 반환.
+
+    회귀 방지: PR-1 의 핵심 invariant — review submission, top-level 토론, 라인 코멘트
+    가 한 매개변수 (`PrConversation.entries`) 안에 모두 들어가야 모델이 PR 의 전체 대화
+    흐름을 한 컨텍스트로 봄.
+    """
+    monkeypatch.setattr(
+        urllib.request,
+        "urlopen",
+        _make_fake_conversation_urlopen(
+            reviews=[{
+                "user": {"login": "alice"},
+                "state": "COMMENTED",
+                "body": "review body",
+                "submitted_at": "2026-04-26T10:00:00Z",
+            }],
+            issue_comments=[{
+                "id": 100,
+                "user": {"login": "bob"},
+                "body": "discussion",
+                "created_at": "2026-04-26T11:00:00Z",
+            }],
+            line_comments=[{
+                "id": 200,
+                "user": {"login": "codex[bot]"},
+                "body": "[Major] 잠재 버그",
+                "path": "a.py",
+                "line": 42,
+                "created_at": "2026-04-26T12:00:00Z",
+                "performed_via_github_app": {"id": 9999},
+            }],
+        ),
+    )
+    monkeypatch.setattr(jwt, "encode", lambda *a, **k: "fake.jwt")
+
+    client = GitHubAppClient(app_id=1234, private_key_pem="-")
+    conv = client.fetch_pr_conversation(_sample_pr())
+
+    kinds = sorted({e.kind for e in conv.entries})
+    assert kinds == ["issue_comment", "line_comment", "review"], (
+        "세 endpoint 모두 매핑돼 entries 에 들어가야"
+    )
+    # 시간 오름차순 정렬
+    assert [e.kind for e in conv.entries] == ["review", "issue_comment", "line_comment"]
+
+
+def test_fetch_pr_conversation_marks_pr_author_correctly(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`pr.author_login` 과 일치하는 entry 는 `is_pr_author=True` — deferred 응답 신뢰 가중치 등에 사용."""
+    monkeypatch.setattr(
+        urllib.request,
+        "urlopen",
+        _make_fake_conversation_urlopen(
+            reviews=[],
+            issue_comments=[
+                {
+                    "id": 1,
+                    "user": {"login": "swift-man"},  # PR 작성자
+                    "body": "이건 follow-up PR 로 분리합니다",
+                    "created_at": "2026-04-26T10:00:00Z",
+                },
+                {
+                    "id": 2,
+                    "user": {"login": "external-reviewer"},
+                    "body": "외부 의견",
+                    "created_at": "2026-04-26T10:01:00Z",
+                },
+            ],
+            line_comments=[],
+        ),
+    )
+    monkeypatch.setattr(jwt, "encode", lambda *a, **k: "fake.jwt")
+
+    pr = PullRequest(
+        repo=RepoRef("o", "r"),
+        number=9,
+        title="t",
+        body="",
+        head_sha="abc",
+        head_ref="feat",
+        base_sha="def",
+        base_ref="main",
+        clone_url="https://example/x.git",
+        changed_files=("a.py",),
+        installation_id=7,
+        is_draft=False,
+        author_login="swift-man",
+    )
+    client = GitHubAppClient(app_id=1234, private_key_pem="-")
+    conv = client.fetch_pr_conversation(pr)
+
+    by_author = {e.author_login: e for e in conv.entries}
+    assert by_author["swift-man"].is_pr_author is True
+    assert by_author["external-reviewer"].is_pr_author is False
+
+
+def test_fetch_pr_conversation_marks_bots_correctly(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`[bot]` 접미사 또는 `performed_via_github_app` 키 → `is_bot=True`."""
+    monkeypatch.setattr(
+        urllib.request,
+        "urlopen",
+        _make_fake_conversation_urlopen(
+            reviews=[],
+            issue_comments=[
+                {
+                    "id": 1,
+                    "user": {"login": "codex-review-bot[bot]"},  # bot suffix
+                    "body": "bot 의견",
+                    "created_at": "2026-04-26T10:00:00Z",
+                },
+                {
+                    "id": 2,
+                    "user": {"login": "via-app-installed"},  # bot suffix 없지만 app
+                    "body": "app 의견",
+                    "created_at": "2026-04-26T10:01:00Z",
+                    "performed_via_github_app": {"id": 5},
+                },
+                {
+                    "id": 3,
+                    "user": {"login": "human-reviewer"},
+                    "body": "사람 의견",
+                    "created_at": "2026-04-26T10:02:00Z",
+                },
+            ],
+            line_comments=[],
+        ),
+    )
+    monkeypatch.setattr(jwt, "encode", lambda *a, **k: "fake.jwt")
+
+    client = GitHubAppClient(app_id=1234, private_key_pem="-")
+    conv = client.fetch_pr_conversation(_sample_pr())
+
+    by_author = {e.author_login: e for e in conv.entries}
+    assert by_author["codex-review-bot[bot]"].is_bot is True
+    assert by_author["via-app-installed"].is_bot is True
+    assert by_author["human-reviewer"].is_bot is False
+
+
+def test_fetch_pr_conversation_graceful_degrade_on_endpoint_failure(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """한 endpoint 실패해도 나머지 entries 는 모음 — 부분 컨텍스트라도 0 보다 가치 있음.
+
+    회귀 방지: 한 GitHub API 호출이 일시 장애 (rate limit, 5xx) 일 때 conversation 전체가
+    빈 채로 반환되면 컨텍스트가 통째로 사라짐. endpoint 별 try/except 로 부분 실패 처리.
+    """
+    import logging
+
+    def fake_urlopen(
+        req: urllib.request.Request,
+        *,
+        timeout: float | None = None,
+        context: ssl.SSLContext | None = None,
+    ) -> _FakeResponse:
+        if "access_tokens" in req.full_url:
+            return _FakeResponse(b'{"token": "tkn", "expires_at": ""}')
+        url = req.full_url
+        # reviews 만 실패, 나머지는 정상
+        if "/reviews" in url:
+            raise urllib.error.HTTPError(url, 500, "boom", {}, None)  # type: ignore[arg-type]
+        if "/issues/" in url and "/comments" in url:
+            return _FakeResponse(
+                json.dumps([{
+                    "id": 1,
+                    "user": {"login": "alice"},
+                    "body": "issue comment 살아남음",
+                    "created_at": "2026-04-26T10:00:00Z",
+                }]).encode()
+            )
+        return _FakeResponse(b"[]")
+
+    monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+    monkeypatch.setattr(jwt, "encode", lambda *a, **k: "fake.jwt")
+
+    client = GitHubAppClient(app_id=1234, private_key_pem="-")
+    with caplog.at_level(logging.WARNING):
+        conv = client.fetch_pr_conversation(_sample_pr())
+
+    # reviews 는 실패해서 비었지만 issue comment 는 살아남음
+    bodies = [e.body for e in conv.entries]
+    assert "issue comment 살아남음" in bodies, "한 endpoint 실패가 다른 entry 를 잃게 만들면 안 됨"
+    assert any(
+        "fetch_pr_conversation: review endpoint failed" in r.getMessage()
+        for r in caplog.records
+    ), "endpoint 실패는 WARN 으로 관측 가능해야"
+
+
+def test_fetch_pr_conversation_uses_newest_first_sort_for_issue_and_line_endpoints(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """issue/line 엔드포인트는 `sort=created&direction=desc`. reviews 는 sort 미지원이라 plain.
+
+    회귀 방지 (codex/gemini PR #29 review #3): 기본 ASC + 10 페이지 cap 으로 1000+ 코멘트
+    PR 의 최신이 누락되던 회귀. issue/line 엔드포인트 newest-first 로 cap 안에서 최신 보장.
+    """
+    captured_urls: list[str] = []
+
+    def fake_urlopen(
+        req: urllib.request.Request,
+        *,
+        timeout: float | None = None,
+        context: ssl.SSLContext | None = None,
+    ) -> _FakeResponse:
+        if "access_tokens" in req.full_url:
+            return _FakeResponse(b'{"token": "tkn", "expires_at": ""}')
+        captured_urls.append(req.full_url)
+        return _FakeResponse(b"[]")
+
+    monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+    monkeypatch.setattr(jwt, "encode", lambda *a, **k: "fake.jwt")
+
+    client = GitHubAppClient(app_id=1234, private_key_pem="-")
+    client.fetch_pr_conversation(_sample_pr())
+
+    by_endpoint = {
+        "reviews": [u for u in captured_urls if "/reviews" in u],
+        "issue": [u for u in captured_urls if "/issues/" in u and "/comments" in u],
+        "line": [u for u in captured_urls if u.endswith("/comments?per_page=100&page=1")
+                 or "/pulls/9/comments?" in u and "issues" not in u],
+    }
+    # issue/line 엔드포인트 URL 에 sort=desc 포함
+    issue_url = next((u for u in captured_urls if "/issues/" in u), "")
+    line_url = next(
+        (u for u in captured_urls if "/pulls/" in u and "/comments" in u and "/reviews" not in u),
+        "",
+    )
+    assert "sort=created" in issue_url and "direction=desc" in issue_url, (
+        f"issue endpoint 가 newest-first 정렬돼야. URL: {issue_url}"
+    )
+    assert "sort=created" in line_url and "direction=desc" in line_url, (
+        f"line endpoint 가 newest-first 정렬돼야. URL: {line_url}"
+    )
+    # reviews 엔드포인트는 sort 파라미터 미지원 — plain
+    reviews_url = next((u for u in captured_urls if "/reviews" in u), "")
+    assert "sort=" not in reviews_url, (
+        f"reviews endpoint 는 sort 파라미터 미지원이라 plain 호출돼야. URL: {reviews_url}"
+    )
+
+
+def test_fetch_pr_conversation_sort_pushes_missing_timestamps_to_end(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """submitted_at 결손 entry (`""`) 는 정렬 결과 끝에 모임 — 가장 작은 값 처리 회귀 방지.
+
+    회귀 방지 (gemini+coderabbit PR #29 review #5): `key=lambda e: e.submitted_at` 만으로
+    정렬하면 빈 문자열이 최소값으로 평가돼 맨 앞에 위치. `(missing flag, ts)` 두 단계 key 로
+    빈 timestamp 가 끝에 가도록.
+    """
+    monkeypatch.setattr(
+        urllib.request,
+        "urlopen",
+        _make_fake_conversation_urlopen(
+            reviews=[],
+            issue_comments=[
+                {
+                    "id": 1,
+                    "user": {"login": "alice"},
+                    "body": "정상 timestamp",
+                    "created_at": "2026-04-26T10:00:00Z",
+                },
+                {
+                    "id": 2,
+                    "user": {"login": "bob"},
+                    "body": "결손 timestamp",
+                    # created_at 없음 — 빈 문자열로 매핑
+                },
+                {
+                    "id": 3,
+                    "user": {"login": "carol"},
+                    "body": "더 최근 timestamp",
+                    "created_at": "2026-04-26T20:00:00Z",
+                },
+            ],
+            line_comments=[],
+        ),
+    )
+    monkeypatch.setattr(jwt, "encode", lambda *a, **k: "fake.jwt")
+
+    client = GitHubAppClient(app_id=1234, private_key_pem="-")
+    conv = client.fetch_pr_conversation(_sample_pr())
+
+    bodies_in_order = [e.body for e in conv.entries]
+    # 정상 timestamp 두 건이 시간순으로 먼저, 결손 timestamp 가 끝에
+    assert bodies_in_order == ["정상 timestamp", "더 최근 timestamp", "결손 timestamp"], (
+        f"빈 timestamp 는 끝으로 정렬돼야. 실제 순서: {bodies_in_order}"
+    )
+
+
+def test_http_converts_json_decode_error_to_runtime_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """200 OK + invalid JSON 본문은 RuntimeError 로 변환돼 호출부의 graceful degrade 그물에 잡혀야 한다.
+
+    회귀 방지 (gemini PR #29 review #2): 프록시 (Cloudflare 등) 가 5xx HTML 페이지를
+    200 으로 가로채는 경우, 또는 GitHub 가 잘못된 응답을 보낸 희소 사례. 이전 구현은
+    `json.loads` 의 `JSONDecodeError` (ValueError 하위) 가 호출부의 `(HTTPError,
+    URLError, RuntimeError)` except 에 안 잡혀 파이프라인 크래시. RuntimeError 변환으로
+    fetch_pr_conversation / execute() 의 graceful degrade 경로에 정상 흡수.
+    """
+
+    def fake_urlopen(
+        req: urllib.request.Request,
+        *,
+        timeout: float | None = None,
+        context: ssl.SSLContext | None = None,
+    ) -> _FakeResponse:
+        # 200 OK + non-JSON HTML body (proxy error page 시뮬)
+        return _FakeResponse(b"<html><body>502 Bad Gateway</body></html>")
+
+    monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+    monkeypatch.setattr(jwt, "encode", lambda *a, **k: "fake.jwt")
+
+    client = GitHubAppClient(app_id=1, private_key_pem="-")
+    with pytest.raises(RuntimeError, match="invalid JSON"):
+        client._http("GET", "https://api.github.com/x", auth="token t")

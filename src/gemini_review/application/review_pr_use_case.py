@@ -1,6 +1,13 @@
 import logging
+import urllib.error
 
-from gemini_review.domain import FileDump, PullRequest, ReviewResult, TokenBudget
+from gemini_review.domain import (
+    FileDump,
+    PrConversation,
+    PullRequest,
+    ReviewResult,
+    TokenBudget,
+)
 from gemini_review.infrastructure.gemini_prompt import assemble_pr_diff, build_diff_prompt
 from gemini_review.interfaces import (
     FileCollector,
@@ -48,6 +55,31 @@ class ReviewPullRequestUseCase:
 
         dump = self._file_collector.collect(repo_path, pr.changed_files, self._budget)
 
+        # PR 대화 컨텍스트 (PR-1: feat/pr-conversation-context-injection): 이번 push 직전
+        # 까지의 review submission / 토론 / 라인 코멘트를 fetch 해 프롬프트에 주입.
+        # 모델이 다른 reviewer 의견 + 작성자 reply 를 컨텍스트로 사용해 같은 지적 반복을
+        # 회피한다. 빈 대화 (PR 의 첫 review) 는 정상 — 섹션 자체가 prompt 에서 빠짐
+        # (사용자 요구: "빈 섹션은 그대로 동작").
+        #
+        # graceful degrade: fetch 실패 시 빈 PrConversation 으로 fall-back — 컨텍스트만
+        # 잠시 못 보여줄 뿐 리뷰는 정상 진행 (Layer F 의 도메인 contract 와 일관).
+        # 예상 가능한 통신/응답 형식 오류만 graceful degrade — 매핑/로직 버그
+        # (TypeError, KeyError 등) 는 통과시켜 회귀를 silently 숨기지 않도록
+        # (coderabbit PR #29 review #4). HTTPError/URLError 는 GitHubAppClient 의
+        # `_http` 가 raise 하는 통신 오류, RuntimeError 는 `_request_list` 의 응답 형식
+        # 오류 (배열 아님 등). 이외 예외는 진짜 결함이라 propagate 가 맞음.
+        try:
+            conversation = self._github.fetch_pr_conversation(pr)
+        except (urllib.error.HTTPError, urllib.error.URLError, RuntimeError) as exc:
+            logger.warning(
+                "fetch_pr_conversation failed for %s#%d (%s); proceeding without "
+                "conversation context",
+                pr.repo.full_name,
+                pr.number,
+                exc,
+            )
+            conversation = PrConversation(entries=())
+
         # 변경 파일이 예산 때문에 잘려 나갔다면 "전체 리뷰"는 성립하지 않는다. 그래도 리뷰를
         # 완전히 건너뛰는 대신 **diff-only fallback** 으로 우회 시도. PR 전체 코드베이스가 모델
         # 컨텍스트를 초과하는 큰 저장소도 변경 라인 자체는 거의 항상 모델 한도 안에 들어오므로,
@@ -64,19 +96,21 @@ class ReviewPullRequestUseCase:
         # (gemini PR #28 review #2). try/finally 로 보장.
         try:
             if dump.exceeded_budget and _changed_missing(pr, dump):
-                result = self._fallback_to_diff_review(pr, dump)
+                result = self._fallback_to_diff_review(pr, dump, conversation)
                 if result is None:
                     return
             else:
                 logger.info(
-                    "reviewing %s#%d — files=%d chars=%d excluded=%d",
+                    "reviewing %s#%d — files=%d chars=%d excluded=%d "
+                    "conversation_entries=%d",
                     pr.repo.full_name,
                     pr.number,
                     len(dump.entries),
                     dump.total_chars,
                     len(dump.excluded),
+                    len(conversation.entries),
                 )
-                result = self._engine.review(pr, dump)
+                result = self._engine.review(pr, dump, conversation=conversation)
             # Layer B — 출처 grounding: 모델이 본문에 인용한 텍스트가 실제 소스 라인에
             # 존재하는지 디스크 레벨로 확인. phantom quote 환각 (예: 모델이 `"@scope"` 를
             # `" @scope"` 로 잘못 토큰화 → "원본에 공백" 단언) 을 [Suggestion] 으로 강등.
@@ -100,6 +134,7 @@ class ReviewPullRequestUseCase:
         self,
         pr: PullRequest,
         dump: FileDump,
+        conversation: PrConversation,
     ) -> ReviewResult | None:
         """전체 dump 가 예산 초과로 변경 파일을 다 못 담을 때의 우회 경로.
 
@@ -137,7 +172,11 @@ class ReviewPullRequestUseCase:
 
         # 실제 모델 입력 = build_diff_prompt 결과. diff_text 만 검사하면 SYSTEM_RULES +
         # DIFF_MODE_NOTICE + PR 메타 overhead 로 한도 초과 가능 (codex PR #26 review #1).
-        prompt_chars = len(build_diff_prompt(pr, diff_text))
+        # 실제 모델 입력은 conversation 까지 포함된 prompt — budget check 도 같은
+        # 입력으로 검사 (codex/coderabbit PR #29 review #2): 이전엔 conversation 빠진
+        # prompt 길이만 검사 → conversation 이 큰 PR 에서 fits() 통과해도 실제
+        # `engine.review_diff(..., conversation=...)` 입력이 한도 초과 가능.
+        prompt_chars = len(build_diff_prompt(pr, diff_text, conversation=conversation))
         if not self._budget.fits(prompt_chars):
             logger.warning(
                 "budget exceeded for %s#%d and diff prompt also too large "
@@ -160,7 +199,7 @@ class ReviewPullRequestUseCase:
             len(diff_text),
             len(pr.file_patches),
         )
-        return self._engine.review_diff(pr, diff_text)
+        return self._engine.review_diff(pr, diff_text, conversation=conversation)
 
 
 def _changed_missing(pr: PullRequest, dump: FileDump) -> bool:
